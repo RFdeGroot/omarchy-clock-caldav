@@ -61,7 +61,7 @@ automatic.
 
 The one thing the shell does *not* do automatically is `bar.centerAnchor`: it is
 matched by literal widget id, not clone-aware, so the last line points it at
-`rfdegroot.clock`. (`bin/meetings-setup` runs this for you too.) To hand it back,
+`rfdegroot.clock`. (`bin/calendar-setup` runs this for you too.) To hand it back,
 `clock-anchor reset` before you disable the plugin.
 
 The two requirements are `vdirsyncer` and `khal`, both in the Arch `extra` repo:
@@ -81,7 +81,7 @@ all — and the agenda area hands you the instructions rather than an error.
 ### The quick way
 
 ```bash
-~/.config/omarchy/plugins/rfdegroot.clock/bin/meetings-setup
+~/.config/omarchy/plugins/rfdegroot.clock/bin/calendar-setup
 ```
 
 It asks which accounts to add (iCloud, Nextcloud, Google), shows the calendars
@@ -224,17 +224,17 @@ in `~/.config/calendar-caldav/config.json`, or from the command line without
 touching your config:
 
 ```bash
-~/.config/omarchy/plugins/rfdegroot.clock/bin/meetings-widget week --demo | jq
+~/.config/omarchy/plugins/rfdegroot.clock/bin/calendar-widget week --demo | jq
 ```
 
 ## The command line
 
 ```bash
 cd ~/.config/omarchy/plugins/rfdegroot.clock/bin
-./meetings-widget day             # today as JSON
-./meetings-widget week            # Monday through Sunday
-./meetings-widget month           # the six-week grid
-./meetings-widget calendars       # your calendar names
+./calendar-widget day             # today as JSON
+./calendar-widget week            # Monday through Sunday
+./calendar-widget month           # the six-week grid
+./calendar-widget calendars       # your calendar names
 ```
 
 Every appointment carries its start and end, its duration, the calendar, its

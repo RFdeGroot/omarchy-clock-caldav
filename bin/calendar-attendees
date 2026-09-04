@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""meetings-attendees: who is coming to one appointment.
+"""calendar-attendees: who is coming to one appointment.
 
 khal's list output carries no attendees, so this reads them straight from the
 .ics file that vdirsyncer keeps on disk. No network, no credentials: the file
 is already there.
 
-    meetings-attendees <calendar-name> <event-id>
+    calendar-attendees <calendar-name> <event-id>
 
 The calendar name is accepted for compatibility with the old interface but not
 needed: the event id (the iCalendar UID) is enough to find the one file. Prints
@@ -27,14 +27,14 @@ from pathlib import Path
 # PATH (mise, pyenv, asdf) can point at an interpreter that has no `icalendar`.
 # The system khal package ships icalendar, so re-exec through a python that can
 # import it. The guard variable stops this from looping.
-if "MEETINGS_ATTENDEES_REEXEC" not in os.environ:
+if "CALDAV_ATTENDEES_REEXEC" not in os.environ:
     try:
         import icalendar  # noqa: F401
     except ImportError:
         for _python in ("/usr/bin/python3", "/usr/bin/python"):
             if os.path.exists(_python):
                 os.execve(_python, [_python, os.path.abspath(__file__), *sys.argv[1:]],
-                          dict(os.environ, MEETINGS_ATTENDEES_REEXEC="1"))
+                          dict(os.environ, CALDAV_ATTENDEES_REEXEC="1"))
 
 PARTSTAT = {
     "ACCEPTED": "accepted",
@@ -46,7 +46,7 @@ PARTSTAT = {
 def calendar_dir() -> Path:
     """The vdir root: the widget passes it in the environment; the config file
     is the fallback for running this by hand."""
-    env = os.environ.get("MEETINGS_CALENDAR_DIR")
+    env = os.environ.get("CALDAV_CALENDAR_DIR")
     if env:
         return Path(env).expanduser()
 

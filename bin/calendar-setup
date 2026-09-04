@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# meetings-setup — configure the accounts and calendars the Clock + Calendar
+# calendar-setup — configure the accounts and calendars the Clock + Calendar
 # widget shows. Run it after installing the plugin:
 #
-#   ~/.config/omarchy/plugins/rfdegroot.clock/bin/meetings-setup
+#   ~/.config/omarchy/plugins/rfdegroot.clock/bin/calendar-setup
 #
 # First run: it asks which accounts to add, shows each one's calendars so you
 # tick the ones you want, writes ~/.config/vdirsyncer/config, does the first
@@ -31,7 +31,7 @@ PY
 )"
 UNITS_SRC="$PLUGIN_DIR/systemd"
 UNITS_DST="$CONFIG_HOME/systemd/user"
-WIDGET="$PLUGIN_DIR/bin/meetings-widget"
+WIDGET="$PLUGIN_DIR/bin/calendar-widget"
 
 # Status goes to stderr so command substitution only ever captures real values.
 c_bold=$'\033[1m'; c_cyan=$'\033[1;36m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_off=$'\033[0m'

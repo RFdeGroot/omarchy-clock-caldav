@@ -18,7 +18,7 @@ import "Model.js" as Model
 //   - "week": the day-column timeline from the CalDAV fork, seven days wide.
 //   - "month": the wall-calendar grid with event chips.
 //
-// The events come from bin/meetings-widget (khal over a vdirsyncer vdir); the
+// The events come from bin/calendar-widget (khal over a vdirsyncer vdir); the
 // script is unchanged from the standalone rfdegroot.calendar-caldav plugin, so
 // an existing sync keeps working untouched.
 //
@@ -35,7 +35,7 @@ Panel {
   // The script that does the talking sits next to this file, so the plugin
   // runs from wherever it was installed without putting anything on $PATH.
   readonly property string script:
-    Qt.resolvedUrl("bin/meetings-widget").toString().replace(/^file:\/\//, "")
+    Qt.resolvedUrl("bin/calendar-widget").toString().replace(/^file:\/\//, "")
 
   readonly property string iconCalendar: ""
 
@@ -761,7 +761,7 @@ Panel {
     "over CalDAV and it is not working yet. The plugin lives in " +
     "~/.config/omarchy/plugins/rfdegroot.clock.\n\n" +
     "The fastest path is to have me run its own interactive setup in a terminal:\n" +
-    "   ~/.config/omarchy/plugins/rfdegroot.clock/bin/meetings-setup\n" +
+    "   ~/.config/omarchy/plugins/rfdegroot.clock/bin/calendar-setup\n" +
     "It installs the tools, asks which accounts and calendars to add, syncs, and enables the " +
     "timer. If it does not fit what I need, do it by hand:\n\n" +
     "1. Tell me to run this in a terminal window myself (it needs my password, so you cannot): " +

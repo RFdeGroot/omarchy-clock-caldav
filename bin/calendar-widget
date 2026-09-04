@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""meetings-widget: the day's agenda as JSON for the bar widget.
+"""calendar-widget: the day's agenda as JSON for the bar widget.
 
-    meetings-widget day             # today
-    meetings-widget day 1           # tomorrow, -1 is yesterday
-    meetings-widget day 0 --only "Someone Else"   # that one calendar only
-    meetings-widget week            # this week, Monday through Sunday
-    meetings-widget week -1         # last week
-    meetings-widget week --demo     # a made-up week, no calendars needed
+    calendar-widget day             # today
+    calendar-widget day 1           # tomorrow, -1 is yesterday
+    calendar-widget day 0 --only "Someone Else"   # that one calendar only
+    calendar-widget week            # this week, Monday through Sunday
+    calendar-widget week -1         # last week
+    calendar-widget week --demo     # a made-up week, no calendars needed
 
 Reads the calendars through khal, which in turn reads the local .ics files that
 vdirsyncer keeps in sync with iCloud, Nextcloud or any other CalDAV server. khal
@@ -42,7 +42,7 @@ def home_path(env_name, fallback, *parts):
 # instead of in here. A bar plugin cannot count on the environment reaching it,
 # so a file is the only thing it can rely on; the env vars stay behind as an
 # override for running this from a shell.
-CONFIG_PATH = os.environ.get("MEETINGS_CONFIG") or home_path(
+CONFIG_PATH = os.environ.get("CALDAV_CONFIG") or home_path(
     "XDG_CONFIG_HOME", ".config", "calendar-caldav", "config.json")
 
 
@@ -59,7 +59,7 @@ if not isinstance(CONFIG, dict):
     CONFIG = {}
 
 DEMO = ("--demo" in ARGV
-        or os.environ.get("MEETINGS_DEMO") == "1"
+        or os.environ.get("CALDAV_DEMO") == "1"
         or CONFIG.get("demo") is True)
 
 # What the panel remembers between openings: which calendars are ticked and
@@ -85,7 +85,7 @@ VIEW = STATE.get("view") if STATE.get("view") in ("day", "week", "month") else "
 # sync by vdirsyncer. khal reads from here. Overridable so a shell can point the
 # script at a throwaway tree.
 CALENDAR_DIR = os.path.expanduser(
-    os.environ.get("MEETINGS_CALENDAR_DIR")
+    os.environ.get("CALDAV_CALENDAR_DIR")
     or CONFIG.get("calendarDir")
     or "~/.calendars")
 
@@ -152,7 +152,7 @@ def khal_launcher():
 
 
 def helper_python():
-    """The interpreter to run meetings-attendees with: it needs `icalendar`,
+    """The interpreter to run calendar-attendees with: it needs `icalendar`,
     which rides along with the system khal package, so reuse whatever could
     import khal."""
     launcher = khal_launcher() or []
@@ -252,7 +252,7 @@ def write_private(path, content):
         return False
 
 
-_skip_env = os.environ.get("MEETINGS_SKIP_CALENDARS")
+_skip_env = os.environ.get("CALDAV_SKIP_CALENDARS")
 SKIP_CALENDARS = [name.strip() for name in (
     _skip_env.split(",") if _skip_env is not None else (CONFIG.get("skipCalendars") or []))]
 
@@ -1024,13 +1024,13 @@ def main():
             dump([])
             return 0
 
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetings-attendees")
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar-attendees")
         try:
             # The argument list goes straight to the process, so no shell is
             # involved that could split a calendar name with a space in it. The
             # helper finds the .ics itself; the vdir root is handed along so it
             # does not have to guess.
-            env = dict(os.environ, MEETINGS_CALENDAR_DIR=CALENDAR_DIR)
+            env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
             result = subprocess.run([helper_python(), helper, calendar_name, event_id],
                                     capture_output=True, text=True, env=env)
             sys.stdout.write(result.stdout if result.returncode == 0 and result.stdout.strip()
