@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "rfdegroot.clock",
+  "name": "Clock + Calendar",
+  "version": "1.0.0",
+  "author": "Roelof de Groot",
+  "description": "The Omarchy clock, extended into a calendar: event dots on the month grid, a per-day agenda, and week and month views. Reads iCloud, Nextcloud and any CalDAV calendar through vdirsyncer and khal.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Clock + Calendar",
+    "description": "Date/time label with a CalDAV calendar popup",
+    "category": "Time",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  }
+}

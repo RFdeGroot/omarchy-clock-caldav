@@ -1,0 +1,13 @@
+[Unit]
+Description=Run vdirsyncer sync every 10 minutes
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=10m
+Persistent=true
+# Let systemd slide the run to coincide with other wake-ups, to save power on
+# a laptop. It does not wake the machine (WakeSystem defaults to no).
+AccuracySec=2m
+
+[Install]
+WantedBy=timers.target

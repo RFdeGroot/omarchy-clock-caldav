@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+#
+# meetings-setup — configure the accounts and calendars the Clock + Calendar
+# widget shows. Run it after installing the plugin:
+#
+#   ~/.config/omarchy/plugins/rfdegroot.clock/bin/meetings-setup
+#
+# First run: it asks which accounts to add, shows each one's calendars so you
+# tick the ones you want, writes ~/.config/vdirsyncer/config, does the first
+# sync, and turns on the ten-minute timer. Run it again and it loads what you
+# have, so you can add or drop a calendar or an account without starting over.
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+VDIR_CONFIG="$CONFIG_HOME/vdirsyncer/config"
+STATUS_DIR="$DATA_HOME/vdirsyncer/status"
+# Where the widget looks for the .ics folders (plugin config, else the default).
+CAL_DIR="$(/usr/bin/python3 - <<'PY' 2>/dev/null || echo "$HOME/.calendars"
+import json, os
+p = os.path.expanduser("~/.config/calendar-caldav/config.json")
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+print(os.path.expanduser(str(d.get("calendarDir") or "~/.calendars")).rstrip("/"))
+PY
+)"
+UNITS_SRC="$PLUGIN_DIR/systemd"
+UNITS_DST="$CONFIG_HOME/systemd/user"
+WIDGET="$PLUGIN_DIR/bin/meetings-widget"
+
+# Status goes to stderr so command substitution only ever captures real values.
+c_bold=$'\033[1m'; c_cyan=$'\033[1;36m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_off=$'\033[0m'
+step()  { printf '\n%s==>%s %s%s%s\n' "$c_cyan" "$c_off" "$c_bold" "$*" "$c_off" >&2; }
+info()  { printf '    %s\n' "$*" >&2; }
+warn()  { printf '%s    %s%s\n' "$c_yellow" "$*" "$c_off" >&2; }
+die()   { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+# --- prompt helpers: gum when it is there, plain read otherwise --------------
+
+prompt() { # prompt <label> [default]
+  local label="$1" def="${2:-}" a
+  if have gum; then
+    if [[ -n "$def" ]]; then gum input --prompt "$label: " --value "$def"
+    else gum input --prompt "$label: "; fi
+  else
+    read -r -p "  $label${def:+ [$def]}: " a; printf '%s' "${a:-$def}"
+  fi
+}
+
+prompt_secret() { # prompt_secret <label>
+  local label="$1" a
+  if have gum; then gum input --password --prompt "$label: "
+  else read -r -s -p "  $label: " a; printf '\n' >&2; printf '%s' "$a"; fi
+}
+
+yesno() { # yesno <question>   -> 0 on yes
+  local q="$1" a
+  if have gum; then gum confirm "$q"
+  else read -r -p "  $q [y/N]: " a; [[ "$a" == [yY]* ]]; fi
+}
+
+choose_one() { # choose_one <header>   ; options on stdin ; pick on stdout
+  local header="$1"
+  if have gum; then gum choose --header "$header"
+  else
+    local -a opts=(); local a i=1
+    mapfile -t opts
+    printf '  %s\n' "$header" >&2
+    for a in "${opts[@]}"; do printf '  %2d) %s\n' "$i" "$a" >&2; i=$((i + 1)); done
+    read -r -p "  > " a
+    [[ "$a" =~ ^[0-9]+$ ]] && printf '%s' "${opts[$((a - 1))]:-}"
+  fi
+}
+
+choose_many() { # choose_many <header> [comma-separated preselected]
+  local header="$1" pre="${2:-}"
+  if have gum; then
+    if [[ -n "$pre" ]]; then gum choose --no-limit --header "$header" --selected "$pre"
+    else gum choose --no-limit --header "$header"; fi
+  else
+    local -a opts=(); local sel n i=1
+    mapfile -t opts
+    printf '  %s\n' "$header" >&2
+    for n in "${opts[@]}"; do
+      local mark=' '; [[ ",$pre," == *",$n,"* ]] && mark='*'
+      printf '  [%s] %2d) %s\n' "$mark" "$i" "$n" >&2; i=$((i + 1))
+    done
+    read -r -p '  full list of numbers to sync (space-separated), or "all": ' sel
+    if [[ -z "$sel" ]]; then
+      # keep the pre-selected set
+      for n in "${opts[@]}"; do [[ ",$pre," == *",$n,"* ]] && printf '%s\n' "$n"; done
+      return
+    fi
+    [[ "$sel" == all ]] && { printf '%s\n' "${opts[@]}"; return; }
+    for n in $sel; do [[ "$n" =~ ^[0-9]+$ ]] && printf '%s\n' "${opts[$((n - 1))]:-}"; done
+  fi
+}
+
+# --- the model: one entry per account --------------------------------------
+#
+#   ACCOUNTS    ordered storage names (never "local")
+#   ACC_BLOCK   verbatim "[storage <name>]\n..." text, kept as-is on a re-run
+#   ACC_PAIR    the pair name that syncs this storage
+#   ACC_COLL    space-separated collection ids to sync ("" means all)
+
+SECRET_MODE=""              # keyring | plain — asked when first needed
+GENERAL_BLOCK=""
+LOCAL_BLOCK=""
+declare -a ACCOUNTS=()
+declare -A ACC_BLOCK=() ACC_PAIR=() ACC_COLL=()
+
+uniq_name() { # uniq_name <base>
+  local base="$1" name="$1" n=2 s
+  while :; do
+    for s in "${ACCOUNTS[@]:-}"; do
+      [[ "$s" == "$name" ]] && { name="$base$n"; n=$((n + 1)); continue 2; }
+    done
+    break
+  done
+  printf '%s' "$name"
+}
+
+coll_ids() { # '["a", "b"]' -> 'a b' ; '["from b"]' or empty -> ''
+  local raw="${1#[}"; raw="${raw%]}"
+  local ids="" tok IFS=,
+  for tok in $raw; do
+    tok="${tok//\"/}"; tok="${tok// /}"
+    [[ -z "$tok" || "$tok" == "fromb" ]] && continue
+    ids+="$tok "
+  done
+  printf '%s' "${ids% }"
+}
+
+display_name_of() { # <pair> <collection-id>
+  local pair="$1" id="$2" f
+  f="$CAL_DIR/$id/displayname"
+  [[ -r "$f" ]] && { cat -- "$f"; return; }
+  f="$STATUS_DIR/$pair/$id.metadata"
+  [[ -r "$f" ]] && sed -n 's/.*"displayname": *"\([^"]*\)".*/\1/p' -- "$f" | head -1 && return
+  printf '%s' "$id"
+}
+
+current_names() { # <storage>   -> "Agenda, Work"  or  "all"
+  local s="$1" ids="${ACC_COLL[$s]}" id out=""
+  [[ -n "$ids" ]] || { printf 'all'; return; }
+  for id in $ids; do out+="$(display_name_of "${ACC_PAIR[$s]}" "$id"), "; done
+  printf '%s' "${out%, }"
+}
+
+# --- read an existing config ----------------------------------------------
+
+load_config() {
+  [[ -f "$VDIR_CONFIG" ]] || return 1
+  local line blk="" sec="" name=""
+  local -a s_names=() p_names=()
+  local -A s_blk=() p_blk=() p_b=() p_coll=()
+
+  _flush() {
+    [[ -n "$sec" ]] || return 0
+    while [[ "$blk" == *$'\n' ]]; do blk="${blk%$'\n'}"; done
+    case "$sec" in
+      general) GENERAL_BLOCK="$blk" ;;
+      local)   LOCAL_BLOCK="$blk" ;;
+      storage) s_names+=("$name"); s_blk[$name]="$blk" ;;
+      pair)    p_names+=("$name"); p_blk[$name]="$blk" ;;
+    esac
+  }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^\[([a-zA-Z]+)([[:space:]]+([^]]+))?\]$ ]]; then
+      _flush
+      blk="$line"$'\n'
+      local kind="${BASH_REMATCH[1]}" sub="${BASH_REMATCH[3]:-}"
+      case "$kind" in
+        general) sec=general; name="" ;;
+        storage) if [[ "$sub" == local ]]; then sec=local; name=local
+                 else sec=storage; name="$sub"; fi ;;
+        pair)    sec=pair; name="$sub" ;;
+        *)       sec=other; name="" ;;
+      esac
+      continue
+    fi
+    [[ -n "$sec" ]] && blk+="$line"$'\n'
+    case "$sec" in
+      pair)
+        [[ "$line" =~ ^[[:space:]]*b[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] && p_b[$name]="${BASH_REMATCH[1]}"
+        [[ "$line" =~ ^[[:space:]]*collections[[:space:]]*=[[:space:]]*(.+)$ ]] && p_coll[$name]="${BASH_REMATCH[1]}"
+        ;;
+      local)
+        [[ "$line" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] \
+          && { CAL_DIR="${BASH_REMATCH[1]%/}"; CAL_DIR="${CAL_DIR/#\~/$HOME}"; }
+        ;;
+      general)
+        [[ "$line" =~ ^[[:space:]]*status_path[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] \
+          && { STATUS_DIR="${BASH_REMATCH[1]%/}"; STATUS_DIR="${STATUS_DIR/#\~/$HOME}"; }
+        ;;
+    esac
+  done <"$VDIR_CONFIG"
+  _flush
+
+  local s p
+  for s in "${s_names[@]:-}"; do
+    [[ -n "$s" ]] || continue
+    for p in "${p_names[@]:-}"; do
+      [[ "${p_b[$p]:-}" == "$s" ]] || continue
+      ACCOUNTS+=("$s")
+      ACC_BLOCK[$s]="${s_blk[$s]}"
+      ACC_PAIR[$s]="$p"
+      ACC_COLL[$s]="$(coll_ids "${p_coll[$p]:-}")"
+      break
+    done
+  done
+  [[ ${#ACCOUNTS[@]} -gt 0 ]]
+}
+
+# --- write the config -----------------------------------------------------
+
+build_config() { # to stdout
+  if [[ -n "$GENERAL_BLOCK" ]]; then printf '%s\n\n' "$GENERAL_BLOCK"
+  else printf '[general]\nstatus_path = "%s/"\n\n' "$STATUS_DIR"; fi
+  if [[ -n "$LOCAL_BLOCK" ]]; then printf '%s\n' "$LOCAL_BLOCK"
+  else printf '[storage local]\ntype = "filesystem"\npath = "%s/"\nfileext = ".ics"\n' "$CAL_DIR"; fi
+
+  local s
+  for s in "${ACCOUNTS[@]}"; do printf '\n%s\n' "${ACC_BLOCK[$s]}"; done
+  for s in "${ACCOUNTS[@]}"; do
+    printf '\n[pair %s]\na = "local"\nb = "%s"\n' "${ACC_PAIR[$s]}" "$s"
+    if [[ -n "${ACC_COLL[$s]}" ]]; then
+      local list="" c
+      for c in ${ACC_COLL[$s]}; do list+="\"$c\", "; done
+      printf 'collections = [%s]\n' "${list%, }"
+    else
+      printf 'collections = ["from b"]\n'
+    fi
+    printf 'metadata = ["displayname", "color"]\n'
+  done
+}
+
+write_config() {
+  local tmp; tmp="$(mktemp)"
+  build_config >"$tmp"
+  mkdir -p "$(dirname "$VDIR_CONFIG")"
+  install -m600 -- "$tmp" "$VDIR_CONFIG"
+  rm -f -- "$tmp"
+}
+
+backup_config() {
+  [[ -f "$VDIR_CONFIG" ]] || return 0
+  local bak="$VDIR_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  cp -- "$VDIR_CONFIG" "$bak"
+  info "backed up your config to $bak"
+}
+
+# --- adding accounts ----------------------------------------------------
+
+pick_secret_mode() {
+  [[ -z "$SECRET_MODE" ]] || return 0
+  if have secret-tool && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] \
+     && yesno "Store passwords in your keyring instead of the config file"; then
+    SECRET_MODE=keyring
+    info "passwords go to the keyring; the config only holds a lookup command"
+  else
+    SECRET_MODE=plain
+    warn "passwords will be written into $VDIR_CONFIG (readable only by you)"
+  fi
+}
+
+password_line() { # <storage> <secret>
+  local s="$1" secret="$2"
+  if [[ "$SECRET_MODE" == keyring ]]; then
+    printf '%s' "$secret" | secret-tool store --label="vdirsyncer $s" \
+      service vdirsyncer account "$s" >/dev/null
+    printf 'password.fetch = ["command", "secret-tool", "lookup", "service", "vdirsyncer", "account", "%s"]' "$s"
+  else
+    printf 'password = "%s"' "$secret"
+  fi
+}
+
+register_account() { # <storage> <pair> <block>
+  ACCOUNTS+=("$1"); ACC_PAIR[$1]="$2"; ACC_BLOCK[$1]="$3"; ACC_COLL[$1]=""
+}
+
+add_caldav() { # <storage> <url> <username> <secret>
+  local s="$1" pwline
+  pick_secret_mode
+  pwline="$(password_line "$s" "$4")"
+  register_account "$s" "${s}_sync" "[storage $s]
+type = \"caldav\"
+url = \"$2\"
+username = \"$3\"
+$pwline"
+}
+
+add_icloud() {
+  local s email pw
+  s="$(uniq_name icloud)"
+  info "iCloud needs an app-specific password (not your Apple password)."
+  info "Make one at https://appleid.apple.com -> Sign-In and Security."
+  email="$(prompt 'Apple ID email')"
+  [[ -n "$email" ]] || { warn "no email — skipped"; return 1; }
+  pw="$(prompt_secret 'App-specific password')"
+  [[ -n "$pw" ]] || { warn "no password — skipped"; return 1; }
+  add_caldav "$s" "https://caldav.icloud.com/" "$email" "$pw"
+  printf '%s' "$s"
+}
+
+add_nextcloud() {
+  local s host user pw
+  s="$(uniq_name nextcloud)"
+  host="$(prompt 'Nextcloud URL' 'https://cloud.example.com')"
+  [[ -n "$host" && "$host" != https://cloud.example.com ]] || { warn "no URL — skipped"; return 1; }
+  [[ "$host" == http://* || "$host" == https://* ]] || host="https://$host"
+  host="${host%/}"
+  user="$(prompt 'Username')"
+  [[ -n "$user" ]] || { warn "no username — skipped"; return 1; }
+  info "Make an app password: Settings -> Security -> Create new app password."
+  pw="$(prompt_secret 'App password')"
+  [[ -n "$pw" ]] || { warn "no password — skipped"; return 1; }
+  add_caldav "$s" "$host/remote.php/dav/" "$user" "$pw"
+  printf '%s' "$s"
+}
+
+add_google() {
+  local s cid csec
+  s="$(uniq_name google)"
+  if ! /usr/bin/python3 -c 'import aiohttp_oauthlib' 2>/dev/null; then
+    warn "Google support needs the python-aiohttp-oauthlib package."
+    yesno "Install it now" && omarchy pkg add python-aiohttp-oauthlib
+  fi
+  info "At console.cloud.google.com: new project -> enable the CalDAV API ->"
+  info "Credentials -> Create OAuth client ID -> application type Desktop app."
+  cid="$(prompt 'Client ID')"
+  [[ -n "$cid" ]] || { warn "no client id — skipped"; return 1; }
+  csec="$(prompt_secret 'Client secret')"
+  [[ -n "$csec" ]] || { warn "no client secret — skipped"; return 1; }
+  register_account "$s" "${s}_sync" "[storage $s]
+type = \"google_calendar\"
+token_file = \"$DATA_HOME/vdirsyncer/google_token_$s\"
+client_id = \"$cid\"
+client_secret = \"$csec\""
+  info "Google opens a browser to authorise on the first sync."
+  printf '%s' "$s"
+}
+
+add_account_menu() { # -> prints new storage name, or nothing
+  local s
+  case "$(printf 'iCloud\nNextcloud\nGoogle\n(cancel)\n' | choose_one 'Which kind of account')" in
+    iCloud)    s="$(add_icloud)" ;;
+    Nextcloud) s="$(add_nextcloud)" ;;
+    Google)    s="$(add_google)" ;;
+    *)         return 1 ;;
+  esac
+  [[ -n "${s:-}" ]] || return 1
+  printf '%s' "$s"
+}
+
+# --- discover + pick calendars for one account --------------------------
+
+discover_rows() { # <storage>   -> lines: id<TAB>name
+  local s="$1"
+  local p="${ACC_PAIR[$s]}" tmp save
+  save="${ACC_COLL[$s]}"; ACC_COLL[$s]=""      # force ["from b"] just for the probe
+  tmp="$(mktemp)"; build_config >"$tmp"
+  ACC_COLL[$s]="$save"
+  # discover lists the calendars twice when some already exist locally (once
+  # under "local:", once under the remote); keep the first sighting of each id.
+  VDIRSYNCER_CONFIG="$tmp" vdirsyncer discover "$p" </dev/null 2>&1 \
+    | sed -n 's/^  - "\([^"]*\)" ("\(.*\)")$/\1\t\2/p' \
+    | awk -F'\t' '!seen[$1]++'
+  rm -f -- "$tmp"
+}
+
+edit_calendars() { # <storage>
+  local s="$1"
+  local p="${ACC_PAIR[$s]}"
+  step "Calendars for [$s]"
+  [[ -n "${ACC_COLL[$s]}" ]] && info "now syncing: $(current_names "$s")"
+
+  local -a rows
+  mapfile -t rows < <(discover_rows "$s")
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    warn "could not list [$s]'s calendars — leaving it unchanged"
+    return
+  fi
+
+  local -a names=(); local -A id_of=()
+  local r id name
+  for r in "${rows[@]}"; do
+    id="${r%%$'\t'*}"; name="${r#*$'\t'}"
+    names+=("$name"); id_of["$name"]="$id"
+  done
+
+  local pre="" cur
+  for cur in ${ACC_COLL[$s]}; do
+    for name in "${names[@]}"; do [[ "${id_of[$name]}" == "$cur" ]] && pre+="$name,"; done
+  done
+
+  local chosen newids="" shown="" old removed=""
+  chosen="$(printf '%s\n' "${names[@]}" | choose_many "Tick the calendars to sync from [$s]" "${pre%,}")"
+  while IFS= read -r name; do
+    [[ -n "$name" && -n "${id_of[$name]:-}" ]] || continue
+    newids+="${id_of[$name]} "; shown+="$name, "
+  done <<<"$chosen"
+  newids="${newids% }"
+
+  for old in ${ACC_COLL[$s]}; do
+    [[ " $newids " == *" $old "* ]] || removed+="$old "
+  done
+  ACC_COLL[$s]="$newids"
+  info "will sync: ${shown%, }"
+
+  if [[ -n "$removed" ]] && yesno "Also delete the local copy of the calendars you unticked"; then
+    for old in $removed; do
+      rm -rf -- "${CAL_DIR:?}/$old"
+      rm -f -- "$STATUS_DIR/$p/$old".*
+    done
+  fi
+}
+
+remove_account_menu() {
+  [[ ${#ACCOUNTS[@]} -gt 1 ]] || { warn "you need at least one account"; return; }
+  local s
+  s="$(printf '%s\n' "${ACCOUNTS[@]}" '(cancel)' | choose_one 'Remove which account')"
+  [[ -n "$s" && "$s" != '(cancel)' ]] || return
+  yesno "Remove account [$s] and stop syncing its calendars" || return
+
+  local p="${ACC_PAIR[$s]}" del="" i
+  for i in "${!ACCOUNTS[@]}"; do [[ "${ACCOUNTS[$i]}" == "$s" ]] && del="$i"; done
+  [[ -n "$del" ]] && ACCOUNTS=("${ACCOUNTS[@]:0:del}" "${ACCOUNTS[@]:del+1}")
+  unset "ACC_BLOCK[$s]" "ACC_PAIR[$s]" "ACC_COLL[$s]"
+
+  if yesno "Also delete its local calendar files and keyring entry"; then
+    local id
+    for id in $(vdirsyncer_local_ids "$p"); do rm -rf -- "${CAL_DIR:?}/$id"; done
+    rm -rf -- "$STATUS_DIR/$p"
+    rm -f -- "$STATUS_DIR/$p.collections"
+    secret-tool clear service vdirsyncer account "$s" 2>/dev/null || true
+  fi
+  info "removed [$s]"
+}
+
+vdirsyncer_local_ids() { # <pair>   -> the collection ids that pair has locally
+  local coll="$STATUS_DIR/$1.collections"
+  [[ -r "$coll" ]] || return 0
+  /usr/bin/python3 - "$coll" 2>/dev/null <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for row in d.get("collections", []):
+    try:
+        for side in row[1]:
+            if isinstance(side, dict) and str(side.get("path", "")).startswith("~"):
+                print(side["path"].rsplit("/", 1)[-1])
+    except Exception:
+        pass
+PY
+}
+
+# --- sync, timer, verify ---------------------------------------------------
+
+sync_now() {
+  step "Syncing — the first run can take a minute"
+  export VDIRSYNCER_CONFIG="$VDIR_CONFIG"
+  yes | vdirsyncer discover || true
+  vdirsyncer sync || warn "sync reported problems (see above)"
+  vdirsyncer metasync || warn "metasync reported problems (calendar names/colours)"
+  unset VDIRSYNCER_CONFIG
+}
+
+enable_timer() {
+  step "Turning on the sync timer"
+  [[ -f "$UNITS_SRC/vdirsyncer.timer" ]] || { warn "shipped units missing — skipping"; return; }
+  mkdir -p "$UNITS_DST"
+  install -m644 -- "$UNITS_SRC/vdirsyncer.service" "$UNITS_DST/vdirsyncer.service"
+  install -m644 -- "$UNITS_SRC/vdirsyncer.timer" "$UNITS_DST/vdirsyncer.timer"
+  if systemctl --user daemon-reload && systemctl --user enable --now vdirsyncer.timer; then
+    info "vdirsyncer sync + metasync now runs every 10 minutes"
+  else
+    warn "could not enable it — run: systemctl --user enable --now vdirsyncer.timer"
+  fi
+}
+
+verify() {
+  step "Checking the widget can read it"
+  rm -f -- "$CACHE_HOME/calendar-caldav/calendars.json"
+  local names; names="$("$WIDGET" calendars 2>/dev/null)"
+  if [[ -z "$names" || "$names" == "[]" ]]; then
+    warn "the widget sees no calendars yet — give the sync a moment, then open the panel"
+  else
+    info "calendars: $(printf '%s' "$names" | tr -d '[]"' | sed 's/ *, */, /g')"
+  fi
+}
+
+# --- top level ----------------------------------------------------------
+
+ensure_tools() {
+  step "Tools"
+  if ! omarchy pkg present vdirsyncer khal >/dev/null 2>&1; then
+    warn "vdirsyncer and khal are required."
+    yesno "Install them now (needs your password)" \
+      && omarchy pkg add vdirsyncer khal \
+      || die "run: omarchy pkg add vdirsyncer khal"
+  fi
+  info "vdirsyncer and khal are installed"
+}
+
+manage() {
+  local s pick
+  while :; do
+    local -a opts=()
+    for s in "${ACCOUNTS[@]}"; do opts+=("Calendars for [$s]  —  $(current_names "$s")"); done
+    opts+=("+ Add an account" "- Remove an account" "✓ Save and sync")
+    pick="$(printf '%s\n' "${opts[@]}" | choose_one 'What do you want to change?')"
+    case "$pick" in
+      "Calendars for ["*)
+        s="${pick#Calendars for [}"; s="${s%%]*}"
+        edit_calendars "$s" ;;
+      "+ Add an account")
+        s="$(add_account_menu)" && [[ -n "$s" ]] && edit_calendars "$s" ;;
+      "- Remove an account") remove_account_menu ;;
+      "✓ Save and sync") return 0 ;;
+      *) return 1 ;;                 # esc / nothing
+    esac
+  done
+}
+
+fresh_setup() {
+  local s
+  if [[ -f "$VDIR_CONFIG" ]]; then
+    warn "$VDIR_CONFIG exists but does not look like one this script made."
+    yesno "Replace it (a timestamped backup is kept)" || die "leaving your config alone"
+  fi
+  backup_config
+
+  step "Accounts"
+  while :; do
+    case "$(printf 'iCloud\nNextcloud\nGoogle\n— done —\n' | choose_one 'Add an account')" in
+      iCloud)    add_icloud >/dev/null || true ;;
+      Nextcloud) add_nextcloud >/dev/null || true ;;
+      Google)    add_google >/dev/null || true ;;
+      *) [[ ${#ACCOUNTS[@]} -gt 0 ]] && break || warn "add at least one account" ;;
+    esac
+  done
+  for s in "${ACCOUNTS[@]}"; do edit_calendars "$s"; done
+}
+
+main() {
+  case "${1:-}" in
+    -h | --help) sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+
+  printf '%sCalendar (CalDAV) — account setup%s\n' "$c_bold" "$c_off"
+  ensure_tools
+
+  if load_config; then
+    step "Your current setup"
+    local s
+    for s in "${ACCOUNTS[@]}"; do info "[$s]  —  $(current_names "$s")"; done
+    backup_config
+    manage || { info "nothing changed"; exit 0; }
+  else
+    fresh_setup
+  fi
+
+  write_config
+  sync_now
+  enable_timer
+  verify
+
+  step "Done"
+  info "Open the widget — your calendars appear within a minute."
+  info "Colours come from the calendars themselves. To override them, set"
+  info "priorities, or hide a calendar in the panel, edit"
+  info "~/.config/calendar-caldav/config.json (the README has the keys)."
+  info "Re-run this script any time to change what you sync."
+}
+
+main "$@"

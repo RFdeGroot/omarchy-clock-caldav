@@ -1,0 +1,11 @@
+[Unit]
+Description=Synchronise calendars with vdirsyncer
+# Only run when the network is up; harmless if the target does not exist.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vdirsyncer sync
+# metasync carries the calendar names and colours; sync alone does not.
+ExecStart=/usr/bin/vdirsyncer metasync

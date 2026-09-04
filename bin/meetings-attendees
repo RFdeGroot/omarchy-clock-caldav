@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""meetings-attendees: who is coming to one appointment.
+
+khal's list output carries no attendees, so this reads them straight from the
+.ics file that vdirsyncer keeps on disk. No network, no credentials: the file
+is already there.
+
+    meetings-attendees <calendar-name> <event-id>
+
+The calendar name is accepted for compatibility with the old interface but not
+needed: the event id (the iCalendar UID) is enough to find the one file. Prints
+a JSON object: {"attendees": [{name, email, status}, ...], "conference": "url"},
+the conference link being whatever X-GOOGLE-CONFERENCE / Teams / CONFERENCE
+property the event carries that khal did not surface. Any failure prints the
+empty shape and exits 0, because a panel that cannot show these should still
+show the appointment.
+"""
+
+import glob
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# This script's shebang is `#!/usr/bin/env python3`, which a version manager on
+# PATH (mise, pyenv, asdf) can point at an interpreter that has no `icalendar`.
+# The system khal package ships icalendar, so re-exec through a python that can
+# import it. The guard variable stops this from looping.
+if "MEETINGS_ATTENDEES_REEXEC" not in os.environ:
+    try:
+        import icalendar  # noqa: F401
+    except ImportError:
+        for _python in ("/usr/bin/python3", "/usr/bin/python"):
+            if os.path.exists(_python):
+                os.execve(_python, [_python, os.path.abspath(__file__), *sys.argv[1:]],
+                          dict(os.environ, MEETINGS_ATTENDEES_REEXEC="1"))
+
+PARTSTAT = {
+    "ACCEPTED": "accepted",
+    "DECLINED": "declined",
+    "TENTATIVE": "tentative",
+}
+
+
+def calendar_dir() -> Path:
+    """The vdir root: the widget passes it in the environment; the config file
+    is the fallback for running this by hand."""
+    env = os.environ.get("MEETINGS_CALENDAR_DIR")
+    if env:
+        return Path(env).expanduser()
+
+    config_home = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    config_path = Path(config_home) / "calendar-caldav" / "config.json"
+    try:
+        data = json.loads(config_path.read_text())
+        if isinstance(data, dict) and data.get("calendarDir"):
+            return Path(str(data["calendarDir"])).expanduser()
+    except (OSError, ValueError):
+        pass
+    return Path.home() / ".calendars"
+
+
+def find_ics(uid: str):
+    """The one file in the vdir tree whose VEVENT carries this UID. vdirsyncer
+    names files by a hash, not the UID, so the file has to be opened to know."""
+    needle = re.compile(r"^UID:" + re.escape(uid) + r"\s*$", re.MULTILINE)
+    root = calendar_dir()
+    for path in glob.glob(str(root / "*" / "*.ics")):
+        if os.path.islink(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        # Unfold continuation lines before matching, the way RFC 5545 says to.
+        if needle.search(text.replace("\r\n ", "").replace("\n ", "")):
+            return path
+    return None
+
+
+# Where a video-call link hides when it is not in the event's own URL: the
+# provider-specific properties Google and Microsoft add, and the standard
+# CONFERENCE property from RFC 7986.
+CONFERENCE_KEYS = ("X-GOOGLE-CONFERENCE",
+                   "X-MICROSOFT-SKYPETEAMSMEETINGURL",
+                   "CONFERENCE")
+
+
+def conference_url(component) -> str:
+    for key in CONFERENCE_KEYS:
+        raw = component.get(key)
+        if raw is None:
+            continue
+        for value in (raw if isinstance(raw, list) else [raw]):
+            url = str(value).strip()
+            if url.lower().startswith("https://"):
+                return url
+    return ""
+
+
+def attendees_of(component):
+    raw = component.get("ATTENDEE")
+    if raw is None:
+        return []
+    entries = raw if isinstance(raw, list) else [raw]
+
+    people = []
+    for entry in entries:
+        params = getattr(entry, "params", {}) or {}
+        if str(params.get("CUTYPE") or "").upper() == "RESOURCE":
+            continue  # a room, not a person
+        email = re.sub(r"(?i)^mailto:", "", str(entry)).strip()
+        name = str(params.get("CN") or email).strip()
+        if not name:
+            continue
+        people.append({
+            "name": name,
+            "email": email,
+            "status": PARTSTAT.get(str(params.get("PARTSTAT") or "").upper(), ""),
+        })
+    return people
+
+
+def event_extras(path: str, uid: str):
+    import icalendar
+
+    with open(path, "rb") as handle:
+        calendar = icalendar.Calendar.from_ical(handle.read())
+
+    for component in calendar.walk("VEVENT"):
+        if str(component.get("UID") or "") != uid:
+            continue
+        return {"attendees": attendees_of(component),
+                "conference": conference_url(component)}
+    return {"attendees": [], "conference": ""}
+
+
+def main() -> int:
+    empty = {"attendees": [], "conference": ""}
+    if len(sys.argv) < 3 or not sys.argv[2]:
+        print(json.dumps(empty))
+        return 0
+
+    uid = sys.argv[2]
+    path = find_ics(uid)
+    if path is None:
+        print(json.dumps(empty))
+        return 0
+
+    print(json.dumps(event_extras(path, uid)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        # Never let a broken lookup take the panel down with it.
+        print(json.dumps({"attendees": [], "conference": ""}))
+        sys.exit(0)
