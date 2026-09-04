@@ -697,7 +697,14 @@ Panel {
   }
 
   function measureAnchor() {
-    if (!cursorItem) return
+    if (!cursorItem) {
+      // Opened without a block to hang off (keyboard, agenda shortcut): float
+      // the card over the grid rather than pinning it to the corner.
+      detailAnchorX = Math.max(Style.space(10), keyCatcher.width / 2 - Style.space(180))
+      detailAnchorY = Style.space(90)
+      detailAnchorHeight = 0
+      return
+    }
     var point = cursorItem.mapToItem(keyCatcher, 0, 0)
     detailAnchorX = point.x
     detailAnchorY = point.y
@@ -992,6 +999,16 @@ Panel {
             : [])
       if (pool.length > 0) root.openEvent(pool[0])
       return JSON.stringify({ opened: !!root.detailEvent })
+    }
+    // Screen-space geometry of the popup card, for pixel-perfect screenshots.
+    function geom(): string {
+      return JSON.stringify({ x: Math.round(panel.cardOrigin.x),
+                              y: Math.round(panel.cardOrigin.y),
+                              w: Math.round(panel.contentWidth),
+                              h: Math.round(panel.contentHeight),
+                              barH: Math.round(panel.barH),
+                              screenW: Math.round(panel.screenW),
+                              screenH: Math.round(panel.screenH) })
     }
   }
 
