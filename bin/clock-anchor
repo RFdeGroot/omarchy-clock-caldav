@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# clock-anchor — point the bar's centre anchor at this plugin, or hand it back.
+#
+#   clock-anchor set     bar.centerAnchor -> rfdegroot.clock   (run after install)
+#   clock-anchor reset   bar.centerAnchor -> omarchy.clock     (run before uninstall)
+#
+# The shell routes the clock's slot to this plugin on its own (the manifest is
+# clonedFrom omarchy.clock), but bar.centerAnchor is matched by literal id and
+# is not clone-aware — so the widget the bar centres on has to be named here.
+# shell.json hot-reloads, so the change takes effect on save.
+
+set -euo pipefail
+
+SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
+BUILTIN="omarchy.clock"
+OURS="rfdegroot.clock"
+
+usage() { sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  set)   target="$OURS" ;;
+  reset) target="$BUILTIN" ;;
+  -h|--help|"") usage; exit 0 ;;
+  *) echo "clock-anchor: unknown command '$1'" >&2; usage; exit 2 ;;
+esac
+
+[[ -f $SHELL_JSON ]] || { echo "clock-anchor: $SHELL_JSON not found" >&2; exit 1; }
+
+/usr/bin/python3 - "$SHELL_JSON" "$target" <<'PY'
+import json, sys, shutil, time
+
+path, target = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    cfg = json.load(fh)
+
+bar = cfg.setdefault("bar", {})
+current = bar.get("centerAnchor", "")
+if current == target:
+    print(f"clock-anchor: centerAnchor already {target}")
+    sys.exit(0)
+
+shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+bar["centerAnchor"] = target
+with open(path, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+print(f"clock-anchor: centerAnchor {current or '(unset)'} -> {target}")
+print("clock-anchor: run 'omarchy restart shell' for the bar to re-centre.")
+PY

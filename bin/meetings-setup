@@ -557,8 +557,12 @@ main() {
     -h | --help) sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
 
-  printf '%sCalendar (CalDAV) — account setup%s\n' "$c_bold" "$c_off"
+  printf '%sClock + Calendar — account setup%s\n' "$c_bold" "$c_off"
   ensure_tools
+
+  # The shell routes the clock slot to us on its own, but bar.centerAnchor is
+  # matched by literal id — so name this plugin there too. Idempotent.
+  "$PLUGIN_DIR/bin/clock-anchor" set >/dev/null 2>&1 || true
 
   if load_config; then
     step "Your current setup"
