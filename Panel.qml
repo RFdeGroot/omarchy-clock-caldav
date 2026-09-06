@@ -646,7 +646,11 @@ Panel {
   function openAgenda() {
     if (!bar || !hasWeb) return
     close()
-    bar.run("omarchy-launch-webapp " + safeUrl(webBase))
+    // Util.execArgv, not bar.run: bar.run hands a concatenated string to
+    // `bash -lc`, and webBase is worked out from vdirsyncer's record of a
+    // synced CalDAV server -- not something this plugin fully controls.
+    // execArgv passes it as its own argv entry with no shell re-parsing it.
+    Util.execArgv(["omarchy-launch-webapp", safeUrl(webBase)])
   }
 
   // ---------------------------------------------------------------------------
@@ -739,7 +743,12 @@ Panel {
     var safe = safeUrl(url)
     if (!bar || safe === "") return
     close()
-    bar.run("omarchy-launch-webapp " + safe)
+    // See openAgenda above: argv, never a shell string. `url` here is an
+    // event's own link or a hangout/conference URL pulled out of invite text
+    // -- somebody else's data the moment it is a shared or work calendar, and
+    // safeUrl()'s character class allows plenty that a shell would happily
+    // execute (`$()`, `;`, `'`, ...).
+    Util.execArgv(["omarchy-launch-webapp", safe])
   }
 
   function joinNow() {
@@ -1175,6 +1184,7 @@ Panel {
               spacing: Style.space(18)
 
               Text {
+                textFormat: Text.PlainText
                 anchors.baseline: heroDate.baseline
                 text: "󰃭" // nf-md-calendar_text
                 color: heroMouse.containsMouse
@@ -1353,6 +1363,7 @@ Panel {
                 spacing: Style.space(10)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: "BORN"
                   color: Qt.darker(root.foreground, 1.5)
@@ -1371,6 +1382,7 @@ Panel {
                   Keys.onPressed: function(event) { root.handleLifeKey(event, expectancyField) }
                 }
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   leftPadding: Style.space(6)
                   text: "LIVE TO"
@@ -1449,6 +1461,7 @@ Panel {
 
               Text {
                 id: lifeLabel
+                textFormat: Text.PlainText
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
                 text: "LIFE"
@@ -1524,6 +1537,7 @@ Panel {
                   color: weekStartMouse.containsMouse
                     ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     text: "W"
                     color: weekStartMouse.containsMouse

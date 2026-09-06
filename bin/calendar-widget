@@ -25,12 +25,33 @@ can run this plugin already has the interpreter it needs.
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
 
 ARGV = sys.argv[1:]
+
+# Every subprocess call below (khal, its own printcalendars/list) gets this
+# deadline: khal is local and normally answers in well under a second, but
+# nothing here should be able to hang the bar forever on a wedged process.
+SUBPROCESS_TIMEOUT = 20
+
+# Free-text fields in an event come from whoever sent the invite, not from
+# the person running this widget. Capping them keeps one oversized invite
+# (or a khal expansion with an unreasonable number of instances) from making
+# the JSON payload -- and the Quickshell process that collects it whole --
+# grow without bound.
+MAX_TEXT_LEN = 4000
+MAX_TITLE_LEN = 300
+MAX_EVENTS_PER_DAY = 200
+
+
+def clip(value, limit):
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit]
 
 
 def home_path(env_name, fallback, *parts):
@@ -46,11 +67,37 @@ CONFIG_PATH = os.environ.get("CALDAV_CONFIG") or home_path(
     "XDG_CONFIG_HOME", ".config", "calendar-caldav", "config.json")
 
 
-def read_json(path, default):
+def read_regular_nofollow(path, max_bytes=1 << 20):
+    """The bytes of a small regular file, read through a descriptor rather
+    than a pathname: O_NOFOLLOW refuses a symlink another same-user process
+    could have planted at this name, O_NONBLOCK keeps a planted FIFO from
+    hanging this read, and the fstat rejects anything that is not a plain
+    file within the size cap -- all three checked on the exact descriptor
+    that is then read, so nothing is re-resolved by name in between."""
     try:
-        with open(path, "r") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            os.close(fd)
+            return None
+        os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    return data if len(data) <= max_bytes else None
+
+
+def read_json(path, default):
+    data = read_regular_nofollow(path)
+    if data is None:
+        return default
+    try:
+        return json.loads(data)
+    except ValueError:
         return default
 
 
@@ -138,8 +185,9 @@ def khal_launcher():
                 probe = subprocess.run([python, "-c", "import khal"],
                                        stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
-            except OSError:
+                                       stderr=subprocess.DEVNULL,
+                                       timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
                 continue
             if probe.returncode == 0:
                 _KHAL_LAUNCHER = [python, khal]
@@ -237,7 +285,10 @@ def write_private(path, content):
     if not private_dir(directory):
         return False
 
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    # A random suffix rather than the PID: O_EXCL already refuses to write
+    # through a symlink planted at this name, but a PID is guessable, and an
+    # unpredictable name means there is nothing to plant in advance at all.
+    tmp = "%s.%s.tmp" % (path, secrets.token_hex(8))
     try:
         handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(handle, "w") as out:
@@ -644,14 +695,17 @@ def row_from_khal(item):
         start_time = str(item.get("start-time") or "")
         end_time = str(item.get("end-time") or "")
 
-    location = str(item.get("location") or "")
-    description = str(item.get("description") or "")
+    # Free text on an invite is whoever sent it, not this widget's user: cap
+    # it here, once, before it goes any further (meeting_link's regex scan
+    # included) rather than trusting every consumer downstream to do it.
+    location = clip(item.get("location"), MAX_TEXT_LEN)
+    description = clip(item.get("description"), MAX_TEXT_LEN)
     url = str(item.get("url") or "")
 
     return {
         "id": str(item.get("uid") or ""),
-        "title": str(item.get("title") or ""),
-        "calendar": str(item.get("calendar") or ""),
+        "title": clip(item.get("title"), MAX_TITLE_LEN),
+        "calendar": clip(item.get("calendar"), MAX_TITLE_LEN),
         "cal_color": normalize_color(item.get("calendar-color")),
         "start_date": start_date,
         "start_time": start_time,
@@ -684,10 +738,10 @@ def parse_rows(from_day, to_day):
                          from_day.strftime("%Y-%m-%d"), "%dd" % span_days])
     try:
         # stdin closed: khal has an interactive path and nothing here can answer
-        # a question.
+        # a question. Timed out: a wedged khal must not hang the bar forever.
         result = subprocess.run(command, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL)
-    except OSError:
+                                stdin=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
@@ -903,6 +957,12 @@ def build_day(rows, day):
         timed.append(event)
     timed.sort(key=lambda e: e["start_minutes"])
 
+    # A day this full is not a real day of meetings; it is spam, or an
+    # expansion gone wrong. Capping here bounds the JSON this dumps and, with
+    # it, how much a collector further down the chain ever has to hold.
+    timed = timed[:MAX_EVENTS_PER_DAY]
+    allday = [event for event in parsed if event["allday"]][:MAX_EVENTS_PER_DAY]
+
     return {
         # Without leading zeroes, because that is how Google Calendar wants it
         # in its url.
@@ -912,7 +972,7 @@ def build_day(rows, day):
         "day_label": day.strftime("%-d"),
         "is_today": day == date.today(),
         "events": assign_columns(timed),
-        "allday": [event for event in parsed if event["allday"]],
+        "allday": allday,
     }
 
 
@@ -948,8 +1008,9 @@ def fetch_calendars():
 
     try:
         result = subprocess.run(khal_argv(["printcalendars"]), capture_output=True,
-                                text=True, stdin=subprocess.DEVNULL)
-    except OSError:
+                                text=True, stdin=subprocess.DEVNULL,
+                                timeout=SUBPROCESS_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
@@ -971,8 +1032,12 @@ def cached_calendars():
         return fetch_calendars() or []
 
     try:
-        if (os.path.isfile(CACHE_PATH) and not os.path.islink(CACHE_PATH)
-                and (datetime.now().timestamp() - os.path.getmtime(CACHE_PATH)) < CACHE_MAX_AGE):
+        # The freshness check is a plain stat -- a caching heuristic, not a
+        # security boundary. read_json is what actually opens the file, and
+        # it does that through a symlink-safe descriptor (read_regular_nofollow),
+        # so a name swapped in between the two just makes the open fail closed
+        # rather than being followed.
+        if (datetime.now().timestamp() - os.path.getmtime(CACHE_PATH)) < CACHE_MAX_AGE:
             parsed = read_json(CACHE_PATH, None)
             if isinstance(parsed, list) and parsed:
                 return [str(name) for name in parsed]
@@ -1032,10 +1097,11 @@ def main():
             # does not have to guess.
             env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
             result = subprocess.run([helper_python(), helper, calendar_name, event_id],
-                                    capture_output=True, text=True, env=env)
+                                    capture_output=True, text=True, env=env,
+                                    timeout=SUBPROCESS_TIMEOUT)
             sys.stdout.write(result.stdout if result.returncode == 0 and result.stdout.strip()
                              else '{"attendees": [], "conference": ""}\n')
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             sys.stdout.write('{"attendees": [], "conference": ""}\n')
         return 0
 

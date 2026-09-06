@@ -20,8 +20,17 @@ import glob
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
+
+# Real invites are a few kilobytes; this only bounds the pathological case
+# (a huge or hostile .ics) rather than affecting anything anyone would
+# actually see. Attendee fields get the same treatment for the same reason:
+# the person who sent the invite chose them, not the person reading it.
+MAX_ICS_BYTES = 8 << 20
+MAX_ATTENDEES = 200
+MAX_FIELD_LEN = 300
 
 # This script's shebang is `#!/usr/bin/env python3`, which a version manager on
 # PATH (mise, pyenv, asdf) can point at an interpreter that has no `icalendar`.
@@ -61,23 +70,44 @@ def calendar_dir() -> Path:
     return Path.home() / ".calendars"
 
 
+def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
+    """A file's bytes through a descriptor, not a pathname: O_NOFOLLOW refuses
+    a symlink another same-user process could have planted at this name, and
+    the fstat + size cap bound what a single .ics is allowed to cost to read.
+    The descriptor that is checked is the one that is read, so there is
+    nothing left to swap in between the two."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    return data if len(data) <= max_bytes else None
+
+
 def find_ics(uid: str):
-    """The one file in the vdir tree whose VEVENT carries this UID. vdirsyncer
-    names files by a hash, not the UID, so the file has to be opened to know."""
+    """The one file in the vdir tree whose VEVENT carries this UID, and its
+    bytes -- returned together so the caller never re-opens the path a second
+    time by name. vdirsyncer names files by a hash, not the UID, so each file
+    has to be read to know."""
     needle = re.compile(r"^UID:" + re.escape(uid) + r"\s*$", re.MULTILINE)
     root = calendar_dir()
     for path in glob.glob(str(root / "*" / "*.ics")):
-        if os.path.islink(path):
+        raw = read_regular_nofollow(path)
+        if raw is None:
             continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
-        except OSError:
-            continue
+        text = raw.decode("utf-8", "replace")
         # Unfold continuation lines before matching, the way RFC 5545 says to.
         if needle.search(text.replace("\r\n ", "").replace("\n ", "")):
-            return path
-    return None
+            return path, raw
+    return None, None
 
 
 # Where a video-call link hides when it is not in the event's own URL: the
@@ -108,11 +138,13 @@ def attendees_of(component):
 
     people = []
     for entry in entries:
+        if len(people) >= MAX_ATTENDEES:
+            break
         params = getattr(entry, "params", {}) or {}
         if str(params.get("CUTYPE") or "").upper() == "RESOURCE":
             continue  # a room, not a person
-        email = re.sub(r"(?i)^mailto:", "", str(entry)).strip()
-        name = str(params.get("CN") or email).strip()
+        email = re.sub(r"(?i)^mailto:", "", str(entry)).strip()[:MAX_FIELD_LEN]
+        name = str(params.get("CN") or email).strip()[:MAX_FIELD_LEN]
         if not name:
             continue
         people.append({
@@ -123,11 +155,10 @@ def attendees_of(component):
     return people
 
 
-def event_extras(path: str, uid: str):
+def event_extras(raw: bytes, uid: str):
     import icalendar
 
-    with open(path, "rb") as handle:
-        calendar = icalendar.Calendar.from_ical(handle.read())
+    calendar = icalendar.Calendar.from_ical(raw)
 
     for component in calendar.walk("VEVENT"):
         if str(component.get("UID") or "") != uid:
@@ -144,12 +175,12 @@ def main() -> int:
         return 0
 
     uid = sys.argv[2]
-    path = find_ics(uid)
+    path, raw = find_ics(uid)
     if path is None:
         print(json.dumps(empty))
         return 0
 
-    print(json.dumps(event_extras(path, uid)))
+    print(json.dumps(event_extras(raw, uid)))
     return 0
 
 
