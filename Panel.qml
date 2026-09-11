@@ -865,6 +865,7 @@ Panel {
 
   property string vdirStamp: ""
   property double lastFetchAt: 0
+  property bool syncing: false
 
   readonly property bool nearBoundary: {
     if (!upcoming) return false
@@ -876,6 +877,15 @@ Panel {
     lastFetchAt = Date.now()
     opened ? refresh() : refreshToday()
     if (opened) refreshWarm()
+  }
+
+  // Pulls the vdir up to date against the CalDAV server right now, instead
+  // of waiting for the vdirsyncer timer's next run.
+  function syncNow() {
+    if (syncing || vdirsyncProc.running) return
+    syncing = true
+    vdirsyncProc.command = ["bash", "-lc", "vdirsyncer sync && vdirsyncer metasync"]
+    vdirsyncProc.running = true
   }
 
   onOpenedChanged: {
@@ -958,6 +968,15 @@ Panel {
     id: calendarProc
     onExited: function(exitCode) {
       root.writingCalendars = false
+      root.skeleton()
+      root.refresh()
+      root.refreshWarm()
+    }
+  }
+  Process {
+    id: vdirsyncProc
+    onExited: function(exitCode) {
+      root.syncing = false
       root.skeleton()
       root.refresh()
       root.refreshWarm()
@@ -1223,6 +1242,39 @@ Panel {
               PanelToolTip {
                 visible: heroMouse.containsMouse
                 text: "Open month view"
+                fontFamily: root.fontFamily
+              }
+            }
+
+            // -- Calendar face: a manual "sync now" nudge, top-right of the hero
+            Text {
+              id: syncIcon
+              textFormat: Text.PlainText
+              visible: root.calendarView
+              anchors.verticalCenter: heroRow.verticalCenter
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(4)
+              text: "󰦖" // same glyph as the week/month loading spinner
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              color: syncMouse.containsMouse
+                ? Style.hoverStateColor(root.foreground, Color.accent) : root.foreground
+              opacity: root.syncing ? 1 : 0.55
+              RotationAnimator on rotation {
+                running: root.syncing
+                from: 0; to: 360; duration: 1000; loops: Animation.Infinite
+              }
+              MouseArea {
+                id: syncMouse
+                anchors.fill: parent
+                anchors.margins: -Style.space(6)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.syncNow()
+              }
+              PanelToolTip {
+                visible: syncMouse.containsMouse
+                text: root.syncing ? "Syncing…" : "Sync calendars now"
                 fontFamily: root.fontFamily
               }
             }
