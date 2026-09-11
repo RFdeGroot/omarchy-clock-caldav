@@ -532,10 +532,14 @@ Panel {
   // The ISO-week number in a grid row opens that week in the timeline.
   function openWeekFromRow(weekRow) {
     if (!weekRow || !weekRow.days || weekRow.days.length === 0) return
-    var d0 = weekRow.days[0]
-    var monday = new Date(d0.year, d0.month, d0.day)
-    // Grid rows start on `weekStart`; the timeline is always Monday-anchored.
-    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7))
+    // Grid rows start on `weekStart`, which may not be Monday, but every row
+    // spans a full 7 days and so always contains exactly one — find it
+    // directly rather than assuming it is the row's first day.
+    var mondayCell = weekRow.days[0]
+    for (var i = 0; i < weekRow.days.length; i++) {
+      if (weekRow.days[i].weekday === 1) { mondayCell = weekRow.days[i]; break }
+    }
+    var monday = new Date(mondayCell.year, mondayCell.month, mondayCell.day)
     viewMode = "week"
     dayOffset = Model.weekDelta(today, monday)
     detailEvent = null
