@@ -334,7 +334,7 @@ Panel {
     id: labelMetrics
     text: root.vertical ? "" : root.clockLabel
     font.family: root.fontFamily
-    font.pixelSize: Style.font.caption
+    font.pixelSize: Style.font.body
   }
 
   implicitWidth: bar && bar.vertical
@@ -1086,7 +1086,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: root.clockLabel
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            font.pixelSize: Style.font.body
             renderType: Text.NativeRendering
             color: root.almostDue ? Color.background
                                   : (root.inMeeting ? root.urgent : root.foreground)
