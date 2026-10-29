@@ -50,7 +50,6 @@ khal config, so there is nothing for you to keep in sync between the two.
 ```bash
 omarchy plugin add https://github.com/RFdeGroot/omarchy-clock-caldav
 omarchy plugin enable rfdegroot.clock
-~/.config/omarchy/plugins/rfdegroot.clock/bin/clock-anchor set
 omarchy restart shell
 ```
 
@@ -58,11 +57,6 @@ The manifest is `clonedFrom` `omarchy.clock`, so `enable` swaps this plugin into
 the bar's clock slot in place of the built-in — same position, same `format`
 setting — and `disable` / `remove` puts the built-in back. That part is
 automatic.
-
-The one thing the shell does *not* do automatically is `bar.centerAnchor`: it is
-matched by literal widget id, not clone-aware, so the last line points it at
-`rfdegroot.clock`. (`bin/calendar-setup` runs this for you too.) To hand it back,
-`clock-anchor reset` before you disable the plugin.
 
 The two requirements are `vdirsyncer` and `khal`, both in the Arch `extra` repo:
 
@@ -243,15 +237,13 @@ colour, its location, its description and its links.
 ## Removing it
 
 ```bash
-~/.config/omarchy/plugins/rfdegroot.clock/bin/clock-anchor reset   # centre anchor -> omarchy.clock
-omarchy plugin disable rfdegroot.clock                             # the stock clock comes back
+omarchy plugin disable rfdegroot.clock   # the stock clock comes back
 omarchy plugin remove rfdegroot.clock
 omarchy restart shell
 ```
 
 `disable` / `remove` restores the built-in `omarchy.clock` to the centre of the
-bar with its settings intact; `clock-anchor reset` points the centre anchor back
-at it. Do the `reset` first, while this plugin is still installed.
+bar with its settings intact.
 
 Left behind, yours to delete: `~/.config/calendar-caldav/` (colours, filters,
 which calendars you ticked) and `~/.cache/calendar-caldav/` (the generated khal
