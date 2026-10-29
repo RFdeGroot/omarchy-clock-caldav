@@ -232,13 +232,11 @@ Panel {
   }
 
   readonly property color urgentFill: "#f7768e"
-  readonly property int urgentMinutes: 5
+  readonly property int soonMinutes: 15
   readonly property int joinWindow: 5
 
   readonly property int minutesUntil: upcoming ? upcoming.start_minutes - nowMinutes : 0
   readonly property bool inMeeting: upcoming !== null && minutesUntil <= 0
-  readonly property bool almostDue:
-    upcoming !== null && minutesUntil > 0 && minutesUntil <= urgentMinutes
 
   readonly property var joinable: {
     if (!upcoming) return null
@@ -1096,7 +1094,6 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barSlot
-    active: root.inMeeting
     tooltipText: ""
 
     // Not an iconComponent: the shell scales that down to icon size, which
@@ -1105,14 +1102,6 @@ Panel {
 
     Item {
       anchors.fill: parent
-      Rectangle {
-        anchors.centerIn: parent
-        width: barContent.implicitWidth + Style.space(8)
-        height: Style.space(18)
-        radius: Style.cornerRadius
-        visible: root.almostDue
-        color: root.urgentFill
-      }
 
       Column {
         id: barVertical
@@ -1127,7 +1116,7 @@ Panel {
             text: modelData
             fontFamily: root.fontFamily
             fontSize: modelData.length > 3 ? Style.bar.iconFont * 0.9 : Style.bar.iconFont
-            color: root.almostDue ? Commons.Color.background : root.foreground
+            color: root.foreground
           }
         }
       }
@@ -1138,12 +1127,12 @@ Panel {
         anchors.centerIn: parent
         spacing: Style.space(5)
 
-        // A dot in the meeting's calendar colour while something is close but
-        // not yet urgent; the whole pill colours once it is.
+        // A dot in the meeting's calendar colour for the quarter of an hour
+        // before it starts. The clock itself never changes colour.
         Rectangle {
           anchors.verticalCenter: parent.verticalCenter
-          visible: root.upcoming !== null && root.minutesUntil <= 15
-                   && root.minutesUntil > 0 && !root.almostDue
+          visible: root.upcoming !== null && root.minutesUntil <= root.soonMinutes
+                   && root.minutesUntil > 0
           width: Style.space(7)
           height: Style.space(7)
           radius: width / 2
@@ -1157,8 +1146,7 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           renderType: Text.NativeRendering
-          color: root.almostDue ? Commons.Color.background
-                                : (root.inMeeting ? root.urgent : root.foreground)
+          color: root.foreground
         }
       }
     }
