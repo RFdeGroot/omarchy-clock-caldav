@@ -43,6 +43,7 @@ Panel {
   readonly property string iconOpen: "\uf08e"
   readonly property string iconCopy: "\uf0c5"
   readonly property string iconCopied: "\uf00c"
+  readonly property string iconLink: "\uf0c1"
   readonly property string iconBell: "\uf0f3"
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
@@ -687,10 +688,16 @@ Panel {
     // the full sentence is the tooltip.
     if (join !== "")
       out.push({ label: "Join", icon: iconJoin, tip: "Join the call", url: join })
+    // Open is the calendar itself, as a web app: launched exactly the way its
+    // app-launcher entry launches it, so the same window rules apply to it
+    // (floating, say). The event's own URL is a page somewhere else, so it
+    // gets its own button and the ordinary browser.
+    if (web !== "")
+      out.push({ label: "Open", icon: iconOpen, tip: "Open the calendar", url: web, webapp: true })
     if (link !== "")
-      out.push({ label: "Open", icon: iconOpen, tip: "Open in the browser", url: link })
-    else if (web !== "")
-      out.push({ label: "Open", icon: iconOpen, tip: "Open the calendar", url: web })
+      out.push(web !== ""
+               ? { label: "Link", icon: iconLink, tip: "Open the event's link in the browser", url: link }
+               : { label: "Open", icon: iconOpen, tip: "Open in the browser", url: link })
     // The call link when there is one, the event's own page otherwise.
     var copyUrl = join !== "" ? join : link
     if (copyUrl !== "")
@@ -787,7 +794,16 @@ Panel {
   function runDetailAction(action) {
     if (!action) return
     if (action.copy) copyLink(action.copy)
+    else if (action.webapp) openWebapp(action.url)
     else openUrl(action.url)
+  }
+
+  // A calendar's web app, the same way openAgenda launches it.
+  function openWebapp(url) {
+    var safe = safeUrl(url)
+    if (safe === "") return
+    close()
+    Util.execArgv(["omarchy-launch-webapp", safe])
   }
 
   // A camera after the title marks the events you click into rather than walk

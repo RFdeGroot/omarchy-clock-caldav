@@ -180,9 +180,11 @@ overflows. Click a day to drop back to the calendar face with it selected.
 Click any event — a dot-day's agenda row, a timeline block, a month chip — and it
 expands into a card: when it is and how long it runs, which calendar, where, who
 is coming and whether they answered, the description. One button joins the video
-call (Zoom, Meet, Teams, Jitsi — whatever URL is in the invite); another opens
-the event in the browser, or failing that the calendar's own web app. `Esc` goes
-back.
+call (Zoom, Meet, Teams, Jitsi — whatever URL is in the invite) in the browser.
+Open starts the calendar's own web app the same way its launcher does, so a
+window rule you have for it — floating, say — applies here too. An event with a
+link of its own gets a Link button for that page, and Copy puts the call link (or
+that link) on the clipboard. `Esc` goes back.
 
 ![An appointment opened over the week](screenshots/detail.png)
 
