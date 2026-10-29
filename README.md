@@ -221,6 +221,10 @@ touching your config:
 ~/.config/omarchy/plugins/rfdegroot.clock/bin/calendar-widget week --demo | jq
 ```
 
+The README screenshots are this demo week. With it switched on in the config,
+`bin/capture-screenshots` retakes all of them on an empty workspace and puts
+you back where you were.
+
 ## The command line
 
 ```bash

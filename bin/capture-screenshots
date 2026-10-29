@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# capture-screenshots — retake the README screenshots from the running plugin.
+#
+#   bin/capture-screenshots [workspace]
+#
+# Needs the plugin enabled and the demo week on ({ "demo": true } in
+# ~/.config/calendar-caldav/config.json), so the shots show made-up events
+# rather than yours. It switches to an empty workspace (9 unless you name
+# another), opens the popup in each view, and crops every shot from the card's
+# own bounds via the rfdegroot.clock.test IPC target: the same width each
+# time, from the card's top edge to 5px below it. The bar is left out because
+# on a screen with a notch the shell moves the clock beside the right-hand
+# modules, away from the card. Then it puts you back where you were, copies
+# the calendar shot to preview.png and squeezes them all to 8-bit PNGs.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
+OUT="$PLUGIN_DIR/screenshots"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/calendar-caldav/config.json"
+TARGET="rfdegroot.clock.test"
+WORKSPACE="${1:-9}"
+# The wide card (week, month) plus 5 on each side; the narrow calendar card is
+# centred in the same width so all four line up in the README.
+WIDTH=1010
+
+for tool in grim hyprctl omarchy-shell magick python3; do
+  command -v "$tool" >/dev/null || { echo "capture-screenshots: $tool is not installed" >&2; exit 1; }
+done
+
+if ! python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("demo") is True else 1)' \
+     "$CONFIG" 2>/dev/null; then
+  echo "capture-screenshots: turn the demo week on first: { \"demo\": true } in $CONFIG" >&2
+  exit 1
+fi
+
+omarchy-shell "$TARGET" state >/dev/null 2>&1 || {
+  echo "capture-screenshots: the plugin is not running (omarchy plugin enable rfdegroot.clock)" >&2
+  exit 1
+}
+
+# Hyprland 0.57 takes Lua dispatchers: `workspace 9` is a syntax error now.
+focus_workspace() { hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null; }
+
+shoot() {
+  local x y w h
+  read -r x y w h < <(omarchy-shell "$TARGET" geom | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print(d["x"], d["y"], d["w"], d["h"])')
+  grim -g "$((x + w / 2 - WIDTH / 2)),$y ${WIDTH}x$((h + 5))" "$OUT/$1.png"
+  echo "  $1.png"
+}
+
+view() {
+  omarchy-shell "$TARGET" setView "$1" >/dev/null
+  sleep 2
+}
+
+previous=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+restore() {
+  omarchy-shell omarchy.clock close >/dev/null 2>&1 || true
+  omarchy-shell "$TARGET" setView calendar >/dev/null 2>&1 || true
+  focus_workspace "$previous"
+}
+trap restore EXIT
+
+focus_workspace "$WORKSPACE"
+sleep 0.8
+omarchy-shell omarchy.clock open
+sleep 1.5
+
+echo "Shooting into $OUT"
+view calendar; shoot calendar
+view week;     shoot week
+view month;    shoot month
+view week
+omarchy-shell "$TARGET" openFirst >/dev/null
+sleep 1.5;     shoot detail
+
+cp "$OUT/calendar.png" "$PLUGIN_DIR/preview.png"
+for f in "$OUT"/{calendar,week,month,detail}.png "$PLUGIN_DIR/preview.png"; do
+  magick "$f" -colors 256 -define png:compression-level=9 PNG8:"$f"
+done
+echo "  preview.png (copy of calendar.png)"
