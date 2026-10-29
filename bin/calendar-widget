@@ -1052,6 +1052,120 @@ def cached_calendars():
     return fresh
 
 
+# The reminders set on appointments (VALARM), indexed by calendar-alarms. Parsing
+# every .ics takes a second or two, so the index is kept until a sync moves the
+# vdir stamp.
+ALARM_INDEX_PATH = home_path("XDG_CACHE_HOME", ".cache", "calendar-caldav", "alarms.json")
+
+# How far ahead the panel is told about, and how late a reminder may still go
+# off: a laptop that wakes ten minutes after one was due should still say so,
+# an hour later it is noise. The panel asks again well within the horizon.
+ALARM_HORIZON = 36 * 3600
+ALARM_LATE = 10 * 60
+# A reminder can be set days ahead (iPhone offers up to a week), so occurrences
+# that far out are expanded to find the ones going off today.
+ALARM_LOOKAHEAD_DAYS = 8
+
+
+def alarm_index():
+    stamp = vdir_stamp()
+    cached = read_json(ALARM_INDEX_PATH, None)
+    if (isinstance(cached, dict) and cached.get("stamp") == stamp
+            and isinstance(cached.get("index"), dict)):
+        return cached["index"]
+
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar-alarms")
+    try:
+        env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
+        result = subprocess.run([helper_python(), helper], capture_output=True, text=True,
+                                env=env, stdin=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT)
+        index = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        index = None
+    if not isinstance(index, dict):
+        return {}
+    write_private(ALARM_INDEX_PATH, json.dumps({"stamp": stamp, "index": index}))
+    return index
+
+
+def alarms_due(now):
+    """Every reminder going off between a little while ago and the horizon, one
+    entry per moment per occurrence, in the order they go off."""
+    if DEMO:
+        return []
+    index = alarm_index()
+    if not index:
+        return []
+    today = now.date()
+    rows = parse_rows(today, today + timedelta(days=ALARM_LOOKAHEAD_DAYS)) or []
+    now_epoch = int(now.timestamp())
+
+    due = {}
+    for row in rows:
+        entry = index.get(row["id"])
+        if not entry:
+            continue
+        allday = not row["start_time"]
+        try:
+            if allday:
+                start_key = row["start_date"]
+                starts = datetime.combine(date.fromisoformat(row["start_date"]), datetime.min.time())
+                ends = datetime.combine(date.fromisoformat(row["end_date"]), datetime.min.time())
+            else:
+                start_key = "%s %s" % (row["start_date"], row["start_time"])
+                starts = datetime.strptime(start_key, "%Y-%m-%d %H:%M")
+                ends = datetime.strptime("%s %s" % (row["end_date"], row["end_time"]),
+                                         "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+
+        # An occurrence edited on its own carries its own alarms, none included.
+        by_start = entry.get("by_start") or {}
+        triggers = by_start[start_key] if start_key in by_start else (entry.get("master") or [])
+        if not triggers:
+            continue
+
+        # The same filters as the grid: a calendar you untick, or a title in
+        # skipTitles, stays quiet here too.
+        event = event_from(row, starts.date())
+        if event is None:
+            continue
+
+        for trigger in triggers:
+            if not isinstance(trigger, dict):
+                continue
+            if "at" in trigger:
+                fires = int(trigger["at"])
+            else:
+                anchor = ends if trigger.get("related") == "end" else starts
+                fires = int((anchor + timedelta(minutes=int(trigger.get("offset", 0)))).timestamp())
+            if not (now_epoch - ALARM_LATE <= fires <= now_epoch + ALARM_HORIZON):
+                continue
+            # Dismissed on another device after it went off: already seen.
+            acknowledged = int(trigger.get("acknowledged") or 0) >= fires
+
+            key = "%s|%s|%d" % (row["id"], start_key, fires)
+            if key in due:
+                # Apple sometimes keeps two copies of one alarm, one of them
+                # dismissed. Either one still pending is enough.
+                due[key]["acknowledged"] = due[key]["acknowledged"] and acknowledged
+                continue
+            due[key] = {
+                "key": key,
+                "at": fires,
+                "acknowledged": acknowledged,
+                "title": event["title"],
+                "calendar": event.get("calendar") or "",
+                "allday": allday,
+                "start": "" if allday else starts.strftime("%H:%M"),
+                "start_epoch": int(starts.timestamp()),
+                "hangout": event.get("hangout") or "",
+            }
+
+    pending = [alarm for alarm in due.values() if not alarm.pop("acknowledged")]
+    return sorted(pending, key=lambda alarm: alarm["at"])
+
+
 def dump(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
 
@@ -1103,6 +1217,13 @@ def main():
                              else '{"attendees": [], "conference": ""}\n')
         except (OSError, subprocess.TimeoutExpired):
             sys.stdout.write('{"attendees": [], "conference": ""}\n')
+        return 0
+
+    if command == "alarms":
+        # The reminders set on your appointments, for the panel to raise as
+        # notifications when they come due.
+        now = datetime.now()
+        dump({"now": int(now.timestamp()), "alarms": alarms_due(now)})
         return 0
 
     if command == "set-view":

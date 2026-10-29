@@ -13,9 +13,15 @@ timeline; the big date opens the month with its events in it.
 The bar label does not change — it is still the clock, still right-click to walk
 the formats, still middle-click for the timezone picker. The one addition is a
 dot in the meeting's colour when something starts within a quarter of an hour;
-the clock itself never changes colour. A meeting with a call link also sends a
-notification a minute before it starts, once, and clicking it opens the call.
-Everything else lives in the popup.
+the clock itself never changes colour. Everything else lives in the popup.
+
+The reminders you set on an appointment — on your phone, in iCloud, anywhere
+that writes them into the calendar — go off here too, as a notification at the
+time they are set for: an hour before, the day before at nine for an all-day
+event, and so on. One you already dismissed on another device stays quiet.
+Clicking the notification opens the calendar, or joins the call if the
+appointment has a link. A meeting with a call link also gets a notification a
+minute before it starts, reminder or not.
 
 The calendars come in over CalDAV — iCloud, Nextcloud, Google, Fastmail, a plain
 Radicale — through [vdirsyncer](https://github.com/pimutils/vdirsyncer) and
@@ -252,7 +258,7 @@ bar with its settings intact.
 
 Left behind, yours to delete: `~/.config/calendar-caldav/` (colours, filters,
 which calendars you ticked) and `~/.cache/calendar-caldav/` (the generated khal
-config and a one-hour cache of calendar names). Your `.ics` files, your
+config, a one-hour cache of calendar names and an index of the reminders). Your `.ics` files, your
 vdirsyncer config and your khal config, if you wrote one, are not this plugin's
 to remove.
 

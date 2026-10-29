@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""calendar-alarms: the reminders set on your appointments, read from the .ics.
+
+khal's list output says nothing about alarms beyond a bell symbol, so this
+reads the VALARM components straight from the .ics files vdirsyncer keeps on
+disk -- the reminders you set on your phone, synced along with the event.
+
+    calendar-alarms
+
+Prints one JSON object keyed by event UID:
+
+    {"<uid>": {"master": [trigger, ...], "by_start": {"<start>": [trigger, ...]}}}
+
+`master` is the alarms of the event itself; `by_start` holds the alarms of
+single occurrences that were edited on their own (a VEVENT with a
+RECURRENCE-ID), keyed by when that occurrence now starts, "YYYY-MM-DD HH:MM"
+local or "YYYY-MM-DD" for all-day, which is how khal reports it. A trigger is
+
+    {"offset": minutes, "related": "start" | "end", "acknowledged": epoch}
+    {"at": epoch, "acknowledged": epoch}
+
+relative to the start (or end) of each occurrence, or at one fixed moment.
+`acknowledged` is when a device last dismissed it (Apple's ACKNOWLEDGED), 0 if
+never. Alarms with ACTION:NONE -- Apple's placeholder for "no alert" -- are
+left out. calendar-widget expands recurrences through khal and works out the
+actual times; this only says what is set. Any failure prints {} and exits 0.
+"""
+
+import glob
+import json
+import os
+import stat
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+MAX_ICS_BYTES = 8 << 20
+MAX_ALARMS_PER_EVENT = 20
+
+if "CALDAV_ALARMS_REEXEC" not in os.environ:
+    try:
+        import icalendar  # noqa: F401
+    except ImportError:
+        for _python in ("/usr/bin/python3", "/usr/bin/python"):
+            if os.path.exists(_python):
+                os.execve(_python, [_python, os.path.abspath(__file__), *sys.argv[1:]],
+                          dict(os.environ, CALDAV_ALARMS_REEXEC="1"))
+
+
+def calendar_dir() -> Path:
+    """The vdir root: the widget passes it in the environment."""
+    env = os.environ.get("CALDAV_CALENDAR_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".calendars"
+
+
+def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
+    """Same rules as calendar-attendees: no symlinks, regular files only, and a
+    size cap checked on the descriptor that is then read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    return data if len(data) <= max_bytes else None
+
+
+def epoch(value) -> int:
+    """A DATE-TIME as epoch seconds. A floating time is local."""
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, date):
+        return int(datetime(value.year, value.month, value.day).timestamp())
+    return 0
+
+
+def start_key(value) -> str:
+    """When an occurrence starts, in khal's terms: local wall-clock time."""
+    if isinstance(value, datetime):
+        local = value.astimezone() if value.tzinfo else value
+        return local.strftime("%Y-%m-%d %H:%M")
+    if isinstance(value, date):
+        return value.isoformat()
+    return ""
+
+
+def trigger_of(alarm):
+    if str(alarm.get("ACTION") or "").upper() == "NONE":
+        return None
+    raw = alarm.get("TRIGGER")
+    if raw is None:
+        return None
+    acknowledged = alarm.get("ACKNOWLEDGED")
+    acked = epoch(acknowledged.dt) if acknowledged is not None else 0
+
+    value = raw.dt
+    if isinstance(value, timedelta):
+        params = getattr(raw, "params", {}) or {}
+        related = "end" if str(params.get("RELATED") or "").upper() == "END" else "start"
+        return {"offset": int(value.total_seconds() // 60), "related": related,
+                "acknowledged": acked}
+    if isinstance(value, (datetime, date)):
+        return {"at": epoch(value), "acknowledged": acked}
+    return None
+
+
+def main() -> int:
+    import icalendar
+
+    index = {}
+    for path in glob.glob(str(calendar_dir() / "*" / "*.ics")):
+        raw = read_regular_nofollow(path)
+        # Most files have no alarm at all; skip parsing those.
+        if raw is None or b"BEGIN:VALARM" not in raw:
+            continue
+        try:
+            calendar = icalendar.Calendar.from_ical(raw)
+        except Exception:
+            continue
+
+        for event in calendar.walk("VEVENT"):
+            uid = str(event.get("UID") or "")
+            if not uid:
+                continue
+            triggers = []
+            for alarm in event.walk("VALARM"):
+                trigger = trigger_of(alarm)
+                if trigger and trigger not in triggers:
+                    triggers.append(trigger)
+                if len(triggers) >= MAX_ALARMS_PER_EVENT:
+                    break
+
+            entry = index.setdefault(uid, {"master": [], "by_start": {}})
+            if event.get("RECURRENCE-ID") is not None:
+                start = event.get("DTSTART")
+                key = start_key(start.dt) if start is not None else ""
+                if key:
+                    entry["by_start"][key] = triggers
+            else:
+                entry["master"] = triggers
+
+    # An event whose only alarms were placeholders has nothing to say.
+    index = {uid: entry for uid, entry in index.items()
+             if entry["master"] or entry["by_start"]}
+    print(json.dumps(index))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        # Never let a broken reminder take the panel down with it.
+        print("{}")
+        sys.exit(0)

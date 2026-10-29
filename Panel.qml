@@ -43,6 +43,7 @@ Panel {
   readonly property string iconOpen: "\uf08e"
   readonly property string iconCopy: "\uf0c5"
   readonly property string iconCopied: "\uf00c"
+  readonly property string iconBell: "\uf0f3"
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
@@ -857,6 +858,78 @@ Panel {
   onUpcomingChanged: announceJoin()
 
   // ---------------------------------------------------------------------------
+  // Reminders
+  // ---------------------------------------------------------------------------
+
+  // The reminders set on appointments in the calendar itself (VALARM), so the
+  // one you set on your phone goes off here too. The script works out when
+  // each is due over the next day and a half; this raises them as they come.
+  property var alarms: []
+  // key -> when it went off, so a refetch does not raise the same one again.
+  property var announcedAlarms: ({})
+  property var alarmQueue: []
+  // Matches the script's ALARM_LATE: a laptop waking up a little after a
+  // reminder was due still shows it, an hour later it does not.
+  readonly property int alarmLateSeconds: 600
+
+  function fetchAlarms() {
+    if (alarmsProc.running) return
+    alarmsProc.command = [root.script, "alarms"]
+    alarmsProc.running = true
+  }
+
+  function checkAlarms() {
+    var now = Date.now() / 1000
+    for (var i = 0; i < alarms.length; i++) {
+      var alarm = alarms[i]
+      if (alarm.at > now || now >= alarm.at + alarmLateSeconds) continue
+      if (announcedAlarms[alarm.key] !== undefined) continue
+      announcedAlarms[alarm.key] = alarm.at
+      alarmQueue.push(alarm)
+    }
+    // Forget what can no longer come back round.
+    for (var key in announcedAlarms)
+      if (announcedAlarms[key] < now - 2 * alarmLateSeconds) delete announcedAlarms[key]
+    sendNextAlarm()
+  }
+
+  function dayWord(when) {
+    var today = new Date()
+    var tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1)
+    if (when.toDateString() === today.toDateString()) return "Today"
+    if (when.toDateString() === tomorrow.toDateString()) return "Tomorrow"
+    return Qt.formatDate(when, "dddd d MMMM")
+  }
+
+  function alarmBody(alarm, hasCall) {
+    var when = new Date(alarm.start_epoch * 1000)
+    if (alarm.allday) return dayWord(when) + ", all day"
+    var minutes = Math.round((alarm.start_epoch - Date.now() / 1000) / 60)
+    var body = minutes <= 0 ? "Starting now"
+             : dayWord(when) + " at " + alarm.start
+               + (minutes < 12 * 60 ? ", in " + humanDelta(minutes) : "")
+    return hasCall ? body + ", click to join" : body
+  }
+
+  // One at a time through a single process, so two reminders due in the same
+  // minute both get out.
+  function sendNextAlarm() {
+    if (alarmNotifyProc.running || alarmQueue.length === 0) return
+    var alarm = alarmQueue.shift()
+    var url = safeUrl(alarm.hangout)
+    // Clicking a call's reminder joins it, the way the one-minute notice does;
+    // any other opens this calendar.
+    var action = url !== "" ? ["xdg-open", url] : ["omarchy-shell", "omarchy.clock", "open"]
+    alarmNotifyProc.command = ["omarchy-notification-send",
+                               "--app-name", "Clock + Calendar",
+                               "-g", root.iconBell,
+                               root.plain(alarm.title),
+                               root.alarmBody(alarm, url !== ""),
+                               "--exec"].concat(action)
+    alarmNotifyProc.running = true
+  }
+
+  // ---------------------------------------------------------------------------
   // Blocked / setup states
   // ---------------------------------------------------------------------------
 
@@ -1044,6 +1117,40 @@ Panel {
   Process { id: copyProc }
   Process { id: joinNotifyProc }
   Process {
+    id: alarmNotifyProc
+    onExited: root.sendNextAlarm()
+  }
+  Process {
+    id: alarmsProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(text)
+          root.alarms = Array.isArray(data.alarms) ? data.alarms : []
+        } catch (e) {
+          return
+        }
+        root.checkAlarms()
+      }
+    }
+  }
+
+  // Due reminders are checked often enough to land within a quarter of a
+  // minute; the list itself is asked for every half hour, and after a sync.
+  Timer {
+    interval: 15000
+    running: root.alarms.length > 0
+    repeat: true
+    onTriggered: root.checkAlarms()
+  }
+  Timer {
+    interval: 1800000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.fetchAlarms()
+  }
+  Process {
     id: attendeesProc
     stdout: StdioCollector {
       onStreamFinished: {
@@ -1103,7 +1210,10 @@ Panel {
       onStreamFinished: {
         try {
           var stamp = String(JSON.parse(text).stamp || "")
-          if (stamp !== "" && stamp !== "0" && stamp !== root.vdirStamp) root.fullFetch()
+          if (stamp !== "" && stamp !== "0" && stamp !== root.vdirStamp) {
+            root.fullFetch()
+            root.fetchAlarms()
+          }
         } catch (e) {}
       }
     }
@@ -1114,7 +1224,8 @@ Panel {
     function state(): string {
       return JSON.stringify({ viewMode: root.viewMode, dayOffset: root.dayOffset,
                               selDay: root.selDay, reachable: root.reachable,
-                              days: root.days.length, calendars: root.calendars })
+                              days: root.days.length, calendars: root.calendars,
+                              alarms: root.alarms.length })
     }
     function setView(mode: string): string {
       root.setView(mode)
@@ -1128,6 +1239,18 @@ Panel {
             : [])
       if (pool.length > 0) root.openEvent(pool[0])
       return JSON.stringify({ opened: !!root.detailEvent })
+    }
+    // A made-up reminder, due now, for something fifteen minutes away. It goes
+    // through the same check as a real one.
+    function testAlarm(): string {
+      var now = Math.floor(Date.now() / 1000)
+      var start = now + 15 * 60
+      root.alarms = root.alarms.concat([{
+        key: "test|" + now, at: now, title: "Test reminder", calendar: "",
+        allday: false, hangout: "", start_epoch: start,
+        start: Qt.formatTime(new Date(start * 1000), "HH:mm") }])
+      root.checkAlarms()
+      return JSON.stringify({ announced: root.announcedAlarms["test|" + now] !== undefined })
     }
     // Screen-space geometry of the popup card, for pixel-perfect screenshots.
     function geom(): string {
