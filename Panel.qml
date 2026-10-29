@@ -801,6 +801,61 @@ Panel {
     openUrl(joinable.hangout)
   }
 
+  // The clock no longer changes colour before a meeting, so a call with a
+  // link says so out loud once, a minute before it starts. Clicking the
+  // notification opens the call.
+  readonly property int notifyMinutes: 1
+
+  // The appointment already announced, so the minute tick and refreshes do
+  // not announce the same call twice, and the next one still gets its own.
+  property string notifiedKey: ""
+
+  // Has to survive a refresh that hands back new objects, so not sameEvent().
+  function eventKey(event) {
+    if (!event) return ""
+    var id = String(event.id || "")
+    if (id !== "") return id
+    return String(event.title || "") + "@" + String(event.start_minutes || "")
+  }
+
+  // The title comes out of somebody else's invite and the notification daemon
+  // renders markup, so angle brackets go.
+  function plain(value) {
+    return String(value || "").replace(/[<>]/g, "")
+  }
+
+  function announceJoin() {
+    if (!joinable) return
+    var url = safeUrl(joinable.hangout)
+    if (url === "") return
+    // Never once it has started: that would only be a reminder you are late.
+    if (minutesUntil > notifyMinutes || minutesUntil <= 0) return
+    var key = eventKey(joinable)
+    if (key === "" || key === notifiedKey) return
+    notifiedKey = key
+    // omarchy-notification-send rather than notify-send: the shell's
+    // notification service renders no action buttons, but runs the --exec
+    // argv when the notification is clicked, detached from this plugin.
+    // An argv with no shell in between, and the URL has been through
+    // safeUrl(), so nothing in it is read as an option or split on a space.
+    // The glyph comes from the bar font, the same camera the grid uses. Not
+    // "Calendar" as the app name: that matches an icon theme's calendar app,
+    // whose icon then replaces the glyph.
+    joinNotifyProc.command = ["omarchy-notification-send",
+                              "--app-name", "Clock + Calendar",
+                              "-g", root.iconJoin,
+                              "-u", "critical",
+                              root.plain(joinable.title),
+                              "Starts in a minute, click to join",
+                              "--exec", "xdg-open", url]
+    joinNotifyProc.running = true
+  }
+
+  // The minute tick moves minutesUntil; a refresh that brings back a different
+  // next appointment moves upcoming without it. Either can be the moment.
+  onMinutesUntilChanged: announceJoin()
+  onUpcomingChanged: announceJoin()
+
   // ---------------------------------------------------------------------------
   // Blocked / setup states
   // ---------------------------------------------------------------------------
@@ -987,6 +1042,7 @@ Panel {
   }
 
   Process { id: copyProc }
+  Process { id: joinNotifyProc }
   Process {
     id: attendeesProc
     stdout: StdioCollector {
