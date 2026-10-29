@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -37,10 +38,14 @@ Panel {
   readonly property string script:
     Qt.resolvedUrl("bin/calendar-widget").toString().replace(/^file:\/\//, "")
 
-  readonly property string iconCalendar: ""
+  readonly property string iconCalendar: "\uf073"
+  readonly property string iconJoin: "\uf03d"
+  readonly property string iconOpen: "\uf08e"
+  readonly property string iconCopy: "\uf0c5"
+  readonly property string iconCopied: "\uf00c"
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color contentFontColor: foreground
 
@@ -666,6 +671,7 @@ Panel {
   property var detailAttendees: []
   property bool loadingAttendees: false
   property int detailCursor: 0
+  property bool copiedLink: false
 
   property real detailAnchorX: 0
   property real detailAnchorY: 0
@@ -676,11 +682,22 @@ Panel {
     if (!detailEvent) return []
     var out = []
     var join = safeUrl(detailEvent.hangout) || safeUrl(detailConference)
-    if (join !== "") out.push({ label: "Join the call", url: join })
-    if (safeUrl(detailEvent.link) !== "")
-      out.push({ label: "Open in browser", url: safeUrl(detailEvent.link) })
-    else if (safeUrl(detailEvent.web) !== "")
-      out.push({ label: "Open calendar", url: safeUrl(detailEvent.web) })
+    var link = safeUrl(detailEvent.link)
+    var web = safeUrl(detailEvent.web)
+    // A glyph and one word each, so they sit on one line under a narrow card;
+    // the full sentence is the tooltip.
+    if (join !== "")
+      out.push({ label: "Join", icon: iconJoin, tip: "Join the call", url: join })
+    if (link !== "")
+      out.push({ label: "Open", icon: iconOpen, tip: "Open in the browser", url: link })
+    else if (web !== "")
+      out.push({ label: "Open", icon: iconOpen, tip: "Open the calendar", url: web })
+    // The call link when there is one, the event's own page otherwise.
+    var copyUrl = join !== "" ? join : link
+    if (copyUrl !== "")
+      out.push({ label: copiedLink ? "Copied" : "Copy",
+                 icon: copiedLink ? iconCopied : iconCopy,
+                 tip: "Copy the link to the clipboard", copy: copyUrl })
     return out
   }
 
@@ -724,6 +741,7 @@ Panel {
     measureAnchor()
     detailEvent = event
     detailCursor = 0
+    copiedLink = false
     detailAttendees = []
     detailConference = ""
     var id = String(event.id || "")
@@ -735,6 +753,7 @@ Panel {
   }
 
   function closeDetail() {
+    copiedLink = false
     detailAttendees = []
     detailConference = ""
     detailEvent = null
@@ -752,7 +771,31 @@ Panel {
     // -- somebody else's data the moment it is a shared or work calendar, and
     // safeUrl()'s character class allows plenty that a shell would happily
     // execute (`$()`, `;`, `'`, ...).
-    Util.execArgv(["omarchy-launch-webapp", safe])
+    // The default browser rather than a webapp window: a meeting link is one
+    // you may want to share or revisit, and a webapp has no address bar.
+    Util.execArgv(["xdg-open", safe])
+  }
+
+  // Copying leaves the card open, where opening closes the panel.
+  function copyLink(url) {
+    copyProc.command = ["wl-copy", "--", url]
+    copyProc.running = true
+    copiedLink = true
+  }
+
+  // Click and Enter both land here, so this is the one place that knows a
+  // detail button either copies or opens.
+  function runDetailAction(action) {
+    if (!action) return
+    if (action.copy) copyLink(action.copy)
+    else openUrl(action.url)
+  }
+
+  // A camera after the title marks the events you click into rather than walk
+  // to. Inside the string, so it elides with the title instead of over it.
+  function titleWithCall(event) {
+    var name = String(event.title || "")
+    return safeUrl(event.hangout) !== "" ? name + "  " + iconJoin : name
   }
 
   function joinNow() {
@@ -1053,67 +1096,69 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barSlot
-    opticalSize: root.clockLabel === "" ? Style.bar.iconCanvas : root.barSlot
     active: root.inMeeting
     tooltipText: ""
 
-    iconComponent: Component {
-      Item {
+    // Not an iconComponent: the shell scales that down to icon size, which
+    // shrinks the clock text to a smudge.
+    hasVisualContent: true
+
+    Item {
+      anchors.fill: parent
+      Rectangle {
+        anchors.centerIn: parent
+        width: barContent.implicitWidth + Style.space(8)
+        height: Style.space(18)
+        radius: Style.cornerRadius
+        visible: root.almostDue
+        color: root.urgentFill
+      }
+
+      Column {
+        id: barVertical
+        visible: root.vertical
+        anchors.centerIn: parent
+        Repeater {
+          model: root.verticalLines
+          OpticalGlyph {
+            required property string modelData
+            width: button.width
+            height: Style.bar.iconSlot
+            text: modelData
+            fontFamily: root.fontFamily
+            fontSize: modelData.length > 3 ? Style.bar.iconFont * 0.9 : Style.bar.iconFont
+            color: root.almostDue ? Commons.Color.background : root.foreground
+          }
+        }
+      }
+
+      Row {
+        id: barContent
+        visible: !root.vertical
+        anchors.centerIn: parent
+        spacing: Style.space(5)
+
+        // A dot in the meeting's calendar colour while something is close but
+        // not yet urgent; the whole pill colours once it is.
         Rectangle {
-          anchors.centerIn: parent
-          width: barContent.implicitWidth + Style.space(8)
-          height: Style.space(18)
-          radius: Style.cornerRadius
-          visible: root.almostDue
-          color: root.urgentFill
+          anchors.verticalCenter: parent.verticalCenter
+          visible: root.upcoming !== null && root.minutesUntil <= 15
+                   && root.minutesUntil > 0 && !root.almostDue
+          width: Style.space(7)
+          height: Style.space(7)
+          radius: width / 2
+          color: root.upcoming ? root.upcoming.color : "transparent"
         }
 
-        Column {
-          id: barVertical
-          visible: root.vertical
-          anchors.centerIn: parent
-          Repeater {
-            model: root.verticalLines
-            OpticalGlyph {
-              required property string modelData
-              width: button.width
-              height: Style.bar.iconSlot
-              text: modelData
-              fontFamily: root.fontFamily
-              fontSize: modelData.length > 3 ? Style.bar.iconFont * 0.9 : Style.bar.iconFont
-              color: root.almostDue ? Color.background : root.foreground
-            }
-          }
-        }
-
-        Row {
-          id: barContent
-          visible: !root.vertical
-          anchors.centerIn: parent
-          spacing: Style.space(5)
-
-          // A dot in the meeting's calendar colour while something is close but
-          // not yet urgent; the whole pill colours once it is.
-          Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.upcoming !== null && root.minutesUntil <= 15
-                     && root.minutesUntil > 0 && !root.almostDue
-            width: Style.space(7)
-            height: Style.space(7)
-            radius: width / 2
-            color: root.upcoming ? root.upcoming.color : "transparent"
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.clockLabel
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            renderType: Text.NativeRendering
-            color: root.almostDue ? Color.background
-                                  : (root.inMeeting ? root.urgent : root.foreground)
-          }
+        Text {
+          textFormat: Text.PlainText
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.clockLabel
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          renderType: Text.NativeRendering
+          color: root.almostDue ? Commons.Color.background
+                                : (root.inMeeting ? root.urgent : root.foreground)
         }
       }
     }
@@ -1166,8 +1211,7 @@ Panel {
       }
       onActivateRequested: {
         if (root.detailEvent) {
-          var action = root.detailActions[root.detailCursor]
-          if (action) root.openUrl(action.url)
+          root.runDetailAction(root.detailActions[root.detailCursor])
         } else if (root.calendarView) {
           if (root.selectedItems.length > 0) root.openEvent(root.selectedItems[0])
           else root.openMonthView()
@@ -1211,7 +1255,7 @@ Panel {
                 anchors.baseline: heroDate.baseline
                 text: "󰃭" // nf-md-calendar_text
                 color: heroMouse.containsMouse
-                  ? Style.hoverStateColor(root.foreground, Color.accent) : root.foreground
+                  ? Style.hoverStateColor(root.foreground, Commons.Color.accent) : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: 40
               }
@@ -1221,7 +1265,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: Qt.formatDate(root.selectedDate, "MMMM d")
                 color: heroMouse.containsMouse
-                  ? Style.hoverStateColor(root.foreground, Color.accent) : root.foreground
+                  ? Style.hoverStateColor(root.foreground, Commons.Color.accent) : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: 44
                 font.bold: true
@@ -1258,7 +1302,7 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               color: syncMouse.containsMouse
-                ? Style.hoverStateColor(root.foreground, Color.accent) : root.foreground
+                ? Style.hoverStateColor(root.foreground, Commons.Color.accent) : root.foreground
               opacity: root.syncing ? 1 : 0.55
               RotationAnimator on rotation {
                 running: root.syncing
@@ -1496,7 +1540,7 @@ Panel {
                   width: Math.round(parent.width * root.yearDone)
                   height: parent.height
                   radius: parent.radius
-                  color: Style.selectedStateColor(root.foreground, Color.accent)
+                  color: Style.selectedStateColor(root.foreground, Commons.Color.accent)
                   Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
                 }
               }
@@ -1549,7 +1593,7 @@ Panel {
                   width: Math.round(parent.width * root.lifeDone)
                   height: parent.height
                   radius: parent.radius
-                  color: Style.selectedStateColor(root.foreground, Color.accent)
+                  color: Style.selectedStateColor(root.foreground, Commons.Color.accent)
                   Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
                 }
               }
@@ -1591,13 +1635,13 @@ Panel {
                   height: Style.space(16)
                   radius: Style.cornerRadius
                   color: weekStartMouse.containsMouse
-                    ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                    ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
                   Text {
                     textFormat: Text.PlainText
                     anchors.centerIn: parent
                     text: "W"
                     color: weekStartMouse.containsMouse
-                      ? Style.hoverStateColor(root.foreground, Color.accent)
+                      ? Style.hoverStateColor(root.foreground, Commons.Color.accent)
                       : Qt.darker(root.foreground, 1.9)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1653,13 +1697,13 @@ Panel {
                     height: gridColumn.cellH
                     radius: Style.cornerRadius
                     color: weekNumMouse.containsMouse
-                      ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                      ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
                     Text {
                       textFormat: Text.PlainText
                       anchors.centerIn: parent
                       text: gridWeekRow.modelData.week
                       color: weekNumMouse.containsMouse
-                        ? Style.hoverStateColor(root.foreground, Color.accent)
+                        ? Style.hoverStateColor(root.foreground, Commons.Color.accent)
                         : Qt.darker(root.foreground, 1.9)
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -1698,10 +1742,10 @@ Panel {
                       height: gridColumn.cellH
                       radius: Style.cornerRadius
                       color: selected
-                        ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                        ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
                       border.width: modelData.today ? Style.spacing.hairline
                                                     : (selected ? 1 : 0)
-                      border.color: Style.normalBorderFor(root.foreground, Color.accent)
+                      border.color: Style.normalBorderFor(root.foreground, Commons.Color.accent)
 
                       MouseArea {
                         anchors.fill: parent
@@ -1826,7 +1870,7 @@ Panel {
                 anchors.top: monthLabel.bottom
                 text: "Today"
                 color: todayPillMouse.containsMouse
-                  ? Style.hoverStateColor(root.foreground, Color.accent) : root.foreground
+                  ? Style.hoverStateColor(root.foreground, Commons.Color.accent) : root.foreground
                 opacity: 0.6
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1909,7 +1953,7 @@ Panel {
                     width: agendaColumn.width
                     height: Style.space(24)
                     color: agendaMouse.containsMouse
-                      ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                      ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
                     radius: Style.cornerRadius
 
                     Rectangle {
@@ -1941,7 +1985,7 @@ Panel {
                       anchors.right: parent.right
                       anchors.rightMargin: Style.space(6)
                       anchors.verticalCenter: parent.verticalCenter
-                      text: agendaRow.modelData.title
+                      text: root.titleWithCall(agendaRow.modelData)
                       elide: Text.ElideRight
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -1990,7 +2034,7 @@ Panel {
                   width: dayName.implicitWidth + Style.space(12)
                   height: dayName.implicitHeight + Style.space(3)
                   radius: height / 2
-                  color: Color.accent
+                  color: Commons.Color.accent
                 }
                 Text {
                   textFormat: Text.PlainText
@@ -1999,7 +2043,7 @@ Panel {
                   text: modelData.short_label
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  color: modelData.is_today ? Color.background : root.foreground
+                  color: modelData.is_today ? Commons.Color.background : root.foreground
                   opacity: modelData.is_today ? 1 : 0.6
                 }
               }
@@ -2139,7 +2183,7 @@ Panel {
                   Rectangle {
                     anchors.fill: parent
                     visible: dayColumn.modelData.is_today
-                    color: Color.accent
+                    color: Commons.Color.accent
                     opacity: 0.05
                   }
                   Rectangle {
@@ -2208,7 +2252,7 @@ Panel {
                         anchors.rightMargin: Style.space(4)
                         anchors.topMargin: Style.space(3)
                         anchors.bottomMargin: Style.space(3)
-                        text: block.lane > 1 ? block.modelData.title : block.modelData.title
+                        text: root.titleWithCall(block.modelData)
                         elide: Text.ElideRight
                         wrapMode: block.height > Style.space(30) ? Text.Wrap : Text.NoWrap
                         font.family: root.fontFamily
@@ -2242,7 +2286,7 @@ Panel {
                   text: root.clockText
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  color: Color.background
+                  color: Commons.Color.background
                 }
               }
               Rectangle {
@@ -2329,7 +2373,7 @@ Panel {
                       anchors.fill: parent
                       anchors.margins: 1
                       visible: mCell.day && mCell.day.is_today
-                      color: Color.accent
+                      color: Commons.Color.accent
                       opacity: 0.06
                     }
                     MouseArea {
@@ -2360,7 +2404,7 @@ Panel {
                         width: Math.max(height, mDateNumber.implicitWidth + Style.space(8))
                         height: mDateNumber.implicitHeight + Style.space(2)
                         radius: height / 2
-                        color: Color.accent
+                        color: Commons.Color.accent
                       }
                       Text {
                         textFormat: Text.PlainText
@@ -2371,7 +2415,7 @@ Panel {
                         text: mCell.day ? String(mCell.day.day_label || mCell.day.short_label || "") : ""
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
-                        color: (mCell.day && mCell.day.is_today) ? Color.background : root.foreground
+                        color: (mCell.day && mCell.day.is_today) ? Commons.Color.background : root.foreground
                         opacity: (mCell.day && mCell.day.in_month === false) ? 0.35 : 0.8
                       }
                     }
@@ -2477,7 +2521,7 @@ Panel {
             titleSize: Style.font.caption
             property bool hot: false
             onHovered: function(isHovered) { hot = isHovered }
-            color: hot ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+            color: hot ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
             borderSpec: Border.flat("transparent", 0)
             onClicked: root.toggleBorrowed()
           }
@@ -2554,7 +2598,7 @@ Panel {
             if (above >= margin) return above
             return Math.max(margin, parent.height - height - margin)
           }
-          color: Color.popups ? Color.popups.background : Color.background
+          color: Commons.Color.popups ? Commons.Color.popups.background : Commons.Color.background
           radius: Style.cornerRadius
           border.width: Style.normalBorderWidth
           border.color: root.detailEvent ? root.detailEvent.color : root.foreground
@@ -2664,18 +2708,23 @@ Panel {
               elide: Text.ElideRight
             }
 
-            Row {
+            Flow {
               width: parent.width
               spacing: Style.space(8)
               visible: root.detailActions.length > 0
               Repeater {
                 model: root.detailActions
                 delegate: Button {
+                  // A long label must not poke out of a narrow card.
+                  width: Math.min(implicitWidth, parent.width)
+                  clip: true
                   text: modelData.label
+                  iconText: modelData.icon || ""
+                  tooltipText: modelData.tip || ""
                   hasCursor: root.detailCursor === index
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  onClicked: root.openUrl(modelData.url)
+                  onClicked: root.runDetailAction(modelData)
                 }
               }
             }
