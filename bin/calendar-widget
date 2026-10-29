@@ -39,6 +39,14 @@ ARGV = sys.argv[1:]
 # nothing here should be able to hang the bar forever on a wedged process.
 SUBPROCESS_TIMEOUT = 20
 
+# Byte ceilings on what a child may hand back, enforced while it is read, not
+# after it has all been collected. A month of khal output is around 100 KB and
+# a whole year under 500 KB, so these only stop the pathological case.
+KHAL_MAX_BYTES = 8 << 20
+HELPER_MAX_BYTES = 4 << 20
+# And on what this script hands the panel, whose StdioCollector keeps all of it.
+OUTPUT_MAX_BYTES = 2 << 20
+
 # Free-text fields in an event come from whoever sent the invite, not from
 # the person running this widget. Capping them keeps one oversized invite
 # (or a khal expansion with an unreasonable number of instances) from making
@@ -91,8 +99,8 @@ def read_regular_nofollow(path, max_bytes=1 << 20):
     return data if len(data) <= max_bytes else None
 
 
-def read_json(path, default):
-    data = read_regular_nofollow(path)
+def read_json(path, default, max_bytes=1 << 20):
+    data = read_regular_nofollow(path, max_bytes)
     if data is None:
         return default
     try:
@@ -140,6 +148,56 @@ CALENDAR_DIR = os.path.expanduser(
 # reader never has to write one and its date formats are known here. It lives in
 # the cache directory next to calendars.json.
 KHAL_CONFIG_OUT = home_path("XDG_CACHE_HOME", ".cache", "calendar-caldav", "khal.config")
+
+
+def run_bounded(argv, max_bytes, env=None):
+    """Run argv with no shell and return (returncode, stdout bytes), or None.
+
+    stdout is read in chunks against one absolute deadline and a byte budget
+    of max_bytes + 1, so overflow is detected rather than truncated into
+    something that still parses. On overflow or timeout the whole process
+    group is killed, not only the leader, and reaped. stderr is discarded."""
+    import selectors
+    import signal
+    import time
+
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    except OSError:
+        return None
+
+    def kill_group():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+
+    deadline = time.monotonic() + SUBPROCESS_TIMEOUT
+    chunks, size = [], 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                kill_group()
+                return None
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                kill_group()
+                return None
+            chunks.append(chunk)
+    proc.stdout.close()
+    try:
+        returncode = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        kill_group()
+        return None
+    return returncode, b"".join(chunks)
 
 
 def khal_config_text():
@@ -374,17 +432,16 @@ def _vdirsyncer_status_dir():
               or next((p for p in (os.path.expanduser("~/.vdirsyncer/config"),
                                    home_path("XDG_CONFIG_HOME", ".config", "vdirsyncer", "config"))
                        if os.path.isfile(p)), None))
-    if config and os.path.isfile(config):
-        try:
-            with open(config) as handle:
-                match = re.search(r'(?m)^\s*status_path\s*=\s*["\']?([^"\'\n]+)',
-                                  handle.read())
-            if match:
-                path = os.path.expanduser(match.group(1).strip().strip('"\'').rstrip("/"))
-                if os.path.isdir(path):
-                    return path
-        except OSError:
-            pass
+    if config:
+        # This file holds the sync passwords, so it is read like everything
+        # else here: one O_NOFOLLOW descriptor, a size cap, nothing re-opened.
+        raw = read_regular_nofollow(config)
+        text = raw.decode("utf-8", "replace") if raw is not None else ""
+        match = re.search(r'(?m)^\s*status_path\s*=\s*["\']?([^"\'\n]+)', text)
+        if match:
+            path = os.path.expanduser(match.group(1).strip().strip('"\'').rstrip("/"))
+            if os.path.isdir(path):
+                return path
     for candidate in (os.path.expanduser("~/.vdirsyncer/status"),
                       home_path("XDG_CONFIG_HOME", ".config", "vdirsyncer", "status"),
                       home_path("XDG_DATA_HOME", ".local/share", "vdirsyncer", "status")):
@@ -409,11 +466,8 @@ def _web_from_caldav_url(url):
 
 
 def _displayname_file(collection_id):
-    try:
-        with open(os.path.join(CALENDAR_DIR, collection_id, "displayname")) as handle:
-            return handle.read().strip()
-    except OSError:
-        return ""
+    raw = read_regular_nofollow(os.path.join(CALENDAR_DIR, collection_id, "displayname"), 4096)
+    return clip(raw.decode("utf-8", "replace").strip(), MAX_TITLE_LEN) if raw is not None else ""
 
 
 def web_by_calendar():
@@ -736,19 +790,16 @@ def parse_rows(from_day, to_day):
     span_days = (to_day - from_day).days + 1
     command = khal_argv(["list", "--json", "all",
                          from_day.strftime("%Y-%m-%d"), "%dd" % span_days])
-    try:
-        # stdin closed: khal has an interactive path and nothing here can answer
-        # a question. Timed out: a wedged khal must not hang the bar forever.
-        result = subprocess.run(command, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
+    # stdin closed: khal has an interactive path and nothing here can answer
+    # a question. Bounded in time and bytes: a wedged khal, or one expanding
+    # an absurd recurrence, must not hang or flood the bar.
+    result = run_bounded(command, KHAL_MAX_BYTES)
+    if result is None or result[0] != 0:
         return None
 
     rows = []
     seen = set()
-    for line in result.stdout.splitlines():
+    for line in result[1].decode("utf-8", "replace").splitlines():
         line = line.strip()
         if not line.startswith("["):
             continue
@@ -1006,17 +1057,12 @@ def fetch_calendars():
     if khal_missing() or not calendars_present():
         return None
 
-    try:
-        result = subprocess.run(khal_argv(["printcalendars"]), capture_output=True,
-                                text=True, stdin=subprocess.DEVNULL,
-                                timeout=SUBPROCESS_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
+    result = run_bounded(khal_argv(["printcalendars"]), HELPER_MAX_BYTES)
+    if result is None or result[0] != 0:
         return None
 
     names = []
-    for line in result.stdout.splitlines():
+    for line in result[1].decode("utf-8", "replace").splitlines():
         name = line.strip()
         if name and name not in names:
             names.append(name)
@@ -1065,22 +1111,23 @@ ALARM_LATE = 10 * 60
 # A reminder can be set days ahead (iPhone offers up to a week), so occurrences
 # that far out are expanded to find the ones going off today.
 ALARM_LOOKAHEAD_DAYS = 8
+# Far more than a day and a half can hold; past it the earliest win.
+MAX_ALARMS = 200
 
 
 def alarm_index():
     stamp = vdir_stamp()
-    cached = read_json(ALARM_INDEX_PATH, None)
+    cached = read_json(ALARM_INDEX_PATH, None, HELPER_MAX_BYTES)
     if (isinstance(cached, dict) and cached.get("stamp") == stamp
             and isinstance(cached.get("index"), dict)):
         return cached["index"]
 
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar-alarms")
+    env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
+    result = run_bounded([helper_python(), helper], HELPER_MAX_BYTES, env=env)
     try:
-        env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
-        result = subprocess.run([helper_python(), helper], capture_output=True, text=True,
-                                env=env, stdin=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT)
-        index = json.loads(result.stdout) if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+        index = json.loads(result[1]) if result is not None and result[0] == 0 else None
+    except ValueError:
         index = None
     if not isinstance(index, dict):
         return {}
@@ -1163,11 +1210,17 @@ def alarms_due(now):
             }
 
     pending = [alarm for alarm in due.values() if not alarm.pop("acknowledged")]
-    return sorted(pending, key=lambda alarm: alarm["at"])
+    return sorted(pending, key=lambda alarm: alarm["at"])[:MAX_ALARMS]
 
 
-def dump(payload):
-    sys.stdout.write(json.dumps(payload) + "\n")
+def dump(payload, fallback=None):
+    """One JSON document on stdout, never more than OUTPUT_MAX_BYTES: the
+    panel's StdioCollector keeps whatever arrives, so the ceiling is here. An
+    oversized answer is replaced by `fallback`, never cut short."""
+    text = json.dumps(payload) + "\n"
+    if len(text.encode("utf-8")) > OUTPUT_MAX_BYTES:
+        text = json.dumps(fallback if fallback is not None else {"ok": False, "error": "too-large"}) + "\n"
+    sys.stdout.write(text)
 
 
 def main():
@@ -1204,26 +1257,32 @@ def main():
             return 0
 
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar-attendees")
+        # The argument list goes straight to the process, so no shell is
+        # involved that could split a calendar name with a space in it. The
+        # helper finds the .ics itself; the vdir root is handed along so it
+        # does not have to guess. Its answer is parsed and dumped again rather
+        # than passed through, so only a JSON object of the expected shape and
+        # within the output cap reaches the panel.
+        empty = {"attendees": [], "conference": ""}
+        env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
+        result = run_bounded([helper_python(), helper, calendar_name, event_id],
+                             HELPER_MAX_BYTES, env=env)
         try:
-            # The argument list goes straight to the process, so no shell is
-            # involved that could split a calendar name with a space in it. The
-            # helper finds the .ics itself; the vdir root is handed along so it
-            # does not have to guess.
-            env = dict(os.environ, CALDAV_CALENDAR_DIR=CALENDAR_DIR)
-            result = subprocess.run([helper_python(), helper, calendar_name, event_id],
-                                    capture_output=True, text=True, env=env,
-                                    timeout=SUBPROCESS_TIMEOUT)
-            sys.stdout.write(result.stdout if result.returncode == 0 and result.stdout.strip()
-                             else '{"attendees": [], "conference": ""}\n')
-        except (OSError, subprocess.TimeoutExpired):
-            sys.stdout.write('{"attendees": [], "conference": ""}\n')
+            extras = json.loads(result[1]) if result is not None and result[0] == 0 else None
+        except ValueError:
+            extras = None
+        if not (isinstance(extras, dict) and isinstance(extras.get("attendees"), list)):
+            extras = empty
+        dump({"attendees": extras["attendees"],
+              "conference": str(extras.get("conference") or "")}, empty)
         return 0
 
     if command == "alarms":
         # The reminders set on your appointments, for the panel to raise as
         # notifications when they come due.
         now = datetime.now()
-        dump({"now": int(now.timestamp()), "alarms": alarms_due(now)})
+        dump({"now": int(now.timestamp()), "alarms": alarms_due(now)},
+             {"now": int(now.timestamp()), "alarms": []})
         return 0
 
     if command == "set-view":
@@ -1353,7 +1412,9 @@ def main():
         for key in ("date_path", "date_label", "is_today", "events", "allday"):
             payload[key] = built[0][key]
 
-    dump(payload)
+    # Too large for the panel reads as a failed khal run, not as an empty day.
+    dump(payload, {"ok": False, "error": "khal-failed",
+                   "events": [], "allday": [], "days": []})
     return 0
 
 

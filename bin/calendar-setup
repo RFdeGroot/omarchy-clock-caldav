@@ -41,6 +41,34 @@ warn()  { printf '%s    %s%s\n' "$c_yellow" "$*" "$c_off" >&2; }
 die()   { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 have()  { command -v "$1" >/dev/null 2>&1; }
 
+# A value that goes between double quotes in the vdirsyncer config. A quote,
+# backslash or control character (a line break included) would end the string
+# and start a config line of its own, so those are refused, never escaped away.
+config_value_ok() { # config_value_ok <label> <value>
+  if [[ "$2" == *[\"\\]* || "$2" == *[[:cntrl:]]* ]]; then
+    warn "$1 contains a quote, backslash or control character, which the config cannot hold — skipped"
+    return 1
+  fi
+}
+
+# A calendar id from the server or vdirsyncer's status. It names a folder under
+# the calendar dir and goes into the config, so it is a plain name or nothing.
+collection_id_ok() { # collection_id_ok <id>
+  [[ "$1" =~ ^[A-Za-z0-9._@+-]+$ && "$1" != "." && "$1" != ".." ]]
+}
+
+# Text from the server shown in this terminal: no escape sequences, capped.
+printable() { LC_ALL=C tr -d '\000-\010\013-\037\177' | head -c 200; }
+
+# A private directory for a file that holds credentials: created 0700, and
+# refused rather than repaired when it is a symlink or not ours.
+private_config_dir() { # private_config_dir <dir>
+  mkdir -p -m 700 -- "$1" || return 1
+  [[ -d "$1" && ! -L "$1" && -O "$1" ]] || { warn "refusing $1: not a directory you own"; return 1; }
+  # Every time, not only when created: an existing directory keeps its mode.
+  chmod 700 -- "$1"
+}
+
 # --- prompt helpers: gum when it is there, plain read otherwise --------------
 
 prompt() { # prompt <label> [default]
@@ -132,6 +160,7 @@ coll_ids() { # '["a", "b"]' -> 'a b' ; '["from b"]' or empty -> ''
   for tok in $raw; do
     tok="${tok//\"/}"; tok="${tok// /}"
     [[ -z "$tok" || "$tok" == "fromb" ]] && continue
+    collection_id_ok "$tok" || continue
     ids+="$tok "
   done
   printf '%s' "${ids% }"
@@ -140,9 +169,10 @@ coll_ids() { # '["a", "b"]' -> 'a b' ; '["from b"]' or empty -> ''
 display_name_of() { # <pair> <collection-id>
   local pair="$1" id="$2" f
   f="$CAL_DIR/$id/displayname"
-  [[ -r "$f" ]] && { cat -- "$f"; return; }
+  [[ -f "$f" && ! -L "$f" ]] && { head -c 4096 -- "$f" | printable; return; }
   f="$STATUS_DIR/$pair/$id.metadata"
-  [[ -r "$f" ]] && sed -n 's/.*"displayname": *"\([^"]*\)".*/\1/p' -- "$f" | head -1 && return
+  [[ -f "$f" && ! -L "$f" ]] && head -c 65536 -- "$f" \
+    | sed -n 's/.*"displayname": *"\([^"]*\)".*/\1/p' | head -1 | printable && return
   printf '%s' "$id"
 }
 
@@ -242,43 +272,63 @@ build_config() { # to stdout
   done
 }
 
+# The config can hold credentials, so it is written the safe way: an
+# unpredictable 0600 temporary in the same private directory, then renamed over
+# the old one. rename replaces a symlink at the name instead of writing
+# through it, which install, cp and > would all do.
 write_config() {
-  local tmp; tmp="$(mktemp)"
-  build_config >"$tmp"
-  mkdir -p "$(dirname "$VDIR_CONFIG")"
-  install -m600 -- "$tmp" "$VDIR_CONFIG"
-  rm -f -- "$tmp"
+  local dir tmp
+  dir="$(dirname -- "$VDIR_CONFIG")"
+  private_config_dir "$dir" || die "could not write $VDIR_CONFIG"
+  tmp="$(umask 077; mktemp -p "$dir" .config.XXXXXXXXXX)" || die "could not write $VDIR_CONFIG"
+  if ! build_config >"$tmp" || ! mv -f -T -- "$tmp" "$VDIR_CONFIG"; then
+    rm -f -- "$tmp"
+    die "could not write $VDIR_CONFIG"
+  fi
 }
 
 backup_config() {
   [[ -f "$VDIR_CONFIG" ]] || return 0
-  local bak="$VDIR_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  cp -- "$VDIR_CONFIG" "$bak"
+  local dir bak
+  dir="$(dirname -- "$VDIR_CONFIG")"
+  private_config_dir "$dir" || return 1
+  # A fresh, unpredictable 0600 name: a dated name could have a symlink
+  # waiting for it.
+  bak="$(umask 077; mktemp -p "$dir" "config.bak.$(date +%Y%m%d%H%M%S).XXXXXX")" || return 1
+  cat -- "$VDIR_CONFIG" >"$bak" || { rm -f -- "$bak"; return 1; }
   info "backed up your config to $bak"
 }
 
 # --- adding accounts ----------------------------------------------------
 
+# The keyring is the default. Plain text in the config file only happens when
+# you say so in as many words; there is no silent fallback to it.
 pick_secret_mode() {
   [[ -z "$SECRET_MODE" ]] || return 0
-  if have secret-tool && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] \
-     && yesno "Store passwords in your keyring instead of the config file"; then
+  if have secret-tool && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     SECRET_MODE=keyring
-    info "passwords go to the keyring; the config only holds a lookup command"
-  else
-    SECRET_MODE=plain
-    warn "passwords will be written into $VDIR_CONFIG (readable only by you)"
+    info "passwords go to your keyring; the config only holds a lookup command"
+    return 0
   fi
+  warn "no keyring available (secret-tool, from libsecret, and a running keyring are needed)"
+  if yesno "Write the passwords in plain text into $VDIR_CONFIG instead"; then
+    SECRET_MODE=plain
+    warn "passwords will be in plain text in $VDIR_CONFIG and its backups (readable only by you)"
+    return 0
+  fi
+  warn "not storing the password — set up a keyring and run this again"
+  return 1
 }
 
-password_line() { # <storage> <secret>
-  local s="$1" secret="$2"
+secret_line() { # <storage> <key> <secret>   -> the config line for one secret
+  local s="$1" key="$2" secret="$3"
   if [[ "$SECRET_MODE" == keyring ]]; then
+    # On stdin, never in argv: /proc/<pid>/cmdline is readable by everyone.
     printf '%s' "$secret" | secret-tool store --label="vdirsyncer $s" \
-      service vdirsyncer account "$s" >/dev/null
-    printf 'password.fetch = ["command", "secret-tool", "lookup", "service", "vdirsyncer", "account", "%s"]' "$s"
+      service vdirsyncer account "$s" >/dev/null || return 1
+    printf '%s.fetch = ["command", "secret-tool", "lookup", "service", "vdirsyncer", "account", "%s"]' "$key" "$s"
   else
-    printf 'password = "%s"' "$secret"
+    printf '%s = "%s"' "$key" "$secret"
   fi
 }
 
@@ -288,8 +338,10 @@ register_account() { # <storage> <pair> <block>
 
 add_caldav() { # <storage> <url> <username> <secret>
   local s="$1" pwline
-  pick_secret_mode
-  pwline="$(password_line "$s" "$4")"
+  config_value_ok "URL" "$2" && config_value_ok "Username" "$3" \
+    && config_value_ok "Password" "$4" || return 1
+  pick_secret_mode || return 1
+  pwline="$(secret_line "$s" password "$4")" || { warn "could not store the password in the keyring"; return 1; }
   register_account "$s" "${s}_sync" "[storage $s]
 type = \"caldav\"
 url = \"$2\"
@@ -317,6 +369,12 @@ add_nextcloud() {
   [[ -n "$host" && "$host" != https://cloud.example.com ]] || { warn "no URL — skipped"; return 1; }
   [[ "$host" == http://* || "$host" == https://* ]] || host="https://$host"
   host="${host%/}"
+  # The app password goes to this address on every sync: plain HTTP only
+  # for a server on this machine.
+  if [[ "$host" == http://* && ! "$host" =~ ^http://(localhost|127\.[0-9.]+|\[::1\])(:[0-9]+)?(/|$) ]]; then
+    warn "refusing http:// — the password would cross the network unencrypted; use https://"
+    return 1
+  fi
   user="$(prompt 'Username')"
   [[ -n "$user" ]] || { warn "no username — skipped"; return 1; }
   info "Make an app password: Settings -> Security -> Create new app password."
@@ -339,11 +397,16 @@ add_google() {
   [[ -n "$cid" ]] || { warn "no client id — skipped"; return 1; }
   csec="$(prompt_secret 'Client secret')"
   [[ -n "$csec" ]] || { warn "no client secret — skipped"; return 1; }
+  config_value_ok "Client ID" "$cid" && config_value_ok "Client secret" "$csec" \
+    && config_value_ok "Data directory" "$DATA_HOME" || return 1
+  local secline
+  pick_secret_mode || return 1
+  secline="$(secret_line "$s" client_secret "$csec")" || { warn "could not store the secret in the keyring"; return 1; }
   register_account "$s" "${s}_sync" "[storage $s]
 type = \"google_calendar\"
 token_file = \"$DATA_HOME/vdirsyncer/google_token_$s\"
 client_id = \"$cid\"
-client_secret = \"$csec\""
+$secline"
   info "Google opens a browser to authorise on the first sync."
   printf '%s' "$s"
 }
@@ -366,13 +429,21 @@ discover_rows() { # <storage>   -> lines: id<TAB>name
   local s="$1"
   local p="${ACC_PAIR[$s]}" tmp save
   save="${ACC_COLL[$s]}"; ACC_COLL[$s]=""      # force ["from b"] just for the probe
-  tmp="$(mktemp)"; build_config >"$tmp"
+  private_config_dir "$(dirname -- "$VDIR_CONFIG")" || { ACC_COLL[$s]="$save"; return; }
+  tmp="$(umask 077; mktemp -p "$(dirname -- "$VDIR_CONFIG")" .probe.XXXXXXXXXX)" \
+    || { ACC_COLL[$s]="$save"; return; }
+  build_config >"$tmp"
   ACC_COLL[$s]="$save"
   # discover lists the calendars twice when some already exist locally (once
   # under "local:", once under the remote); keep the first sighting of each id.
   VDIRSYNCER_CONFIG="$tmp" vdirsyncer discover "$p" </dev/null 2>&1 \
     | sed -n 's/^  - "\([^"]*\)" ("\(.*\)")$/\1\t\2/p' \
-    | awk -F'\t' '!seen[$1]++'
+    | awk -F'\t' '!seen[$1]++' \
+    | while IFS=$'\t' read -r id name; do
+        # Only ids that are plain names reach the config or the file system.
+        collection_id_ok "$id" || continue
+        printf '%s\t%s\n' "$id" "$(printf '%s' "$name" | printable)"
+      done
   rm -f -- "$tmp"
 }
 
@@ -437,7 +508,16 @@ remove_account_menu() {
 
   if yesno "Also delete its local calendar files and keyring entry"; then
     local id
-    for id in $(vdirsyncer_local_ids "$p"); do rm -rf -- "${CAL_DIR:?}/$id"; done
+    # One id per line, never word-split or globbed, and only a plain name
+    # that is a real directory (not a symlink) inside the calendar dir.
+    while IFS= read -r id; do
+      if ! collection_id_ok "$id"; then
+        warn "left alone: unexpected calendar id $(printf '%s' "$id" | printable)"
+        continue
+      fi
+      [[ -d "${CAL_DIR:?}/$id" && ! -L "${CAL_DIR:?}/$id" ]] || continue
+      rm -rf -- "${CAL_DIR:?}/$id"
+    done < <(vdirsyncer_local_ids "$p")
     rm -rf -- "$STATUS_DIR/$p"
     rm -f -- "$STATUS_DIR/$p.collections"
     secret-tool clear service vdirsyncer account "$s" 2>/dev/null || true

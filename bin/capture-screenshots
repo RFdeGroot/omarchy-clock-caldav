@@ -21,6 +21,8 @@ OUT="$PLUGIN_DIR/screenshots"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/calendar-caldav/config.json"
 TARGET="rfdegroot.clock.test"
 WORKSPACE="${1:-9}"
+# It goes into a Lua dispatcher string below, so a number and nothing else.
+[[ "$WORKSPACE" =~ ^[1-9][0-9]{0,2}$ ]] || { echo "capture-screenshots: workspace must be a number" >&2; exit 2; }
 # The wide card (week, month) plus 5 on each side; the narrow calendar card is
 # centred in the same width so all four line up in the README.
 WIDTH=1010
@@ -41,12 +43,16 @@ omarchy-shell "$TARGET" state >/dev/null 2>&1 || {
 }
 
 # Hyprland 0.57 takes Lua dispatchers: `workspace 9` is a syntax error now.
-focus_workspace() { hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null; }
+# Only ever called with a validated number.
+focus_workspace() {
+  [[ "$1" =~ ^-?[0-9]{1,4}$ ]] || return 1
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null
+}
 
 shoot() {
   local x y w h
   read -r x y w h < <(omarchy-shell "$TARGET" geom | python3 -c \
-    'import json,sys; d=json.load(sys.stdin); print(d["x"], d["y"], d["w"], d["h"])')
+    'import json,sys; d=json.load(sys.stdin); print(*(int(d[k]) for k in ("x", "y", "w", "h")))')
   grim -g "$((x + w / 2 - WIDTH / 2)),$y ${WIDTH}x$((h + 5))" "$OUT/$1.png"
   echo "  $1.png"
 }
@@ -56,7 +62,7 @@ view() {
   sleep 2
 }
 
-previous=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+previous=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["id"]))')
 restore() {
   omarchy-shell omarchy.clock close >/dev/null 2>&1 || true
   omarchy-shell "$TARGET" setView calendar >/dev/null 2>&1 || true

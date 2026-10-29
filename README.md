@@ -93,6 +93,13 @@ Run it again and it loads what you already have — it lists your accounts and
 their synced calendars, and lets you tick a calendar on or off, add an account,
 or remove one, without disturbing the rest. It backs up the config each time.
 
+Passwords and the Google client secret go into your keyring (`secret-tool`,
+under `service vdirsyncer`); the config only holds the command that looks them
+up. Without a keyring it asks before writing them into the config in plain
+text, and stops if you say no. The config and its backups are created `0600` in
+a `0700` folder. A Nextcloud address has to be `https://` unless the server is
+on this machine.
+
 You still need the credentials ready:
 
 - **iCloud** — an app-specific password from [appleid.apple.com](https://appleid.apple.com)
@@ -256,11 +263,25 @@ omarchy restart shell
 `disable` / `remove` restores the built-in `omarchy.clock` to the centre of the
 bar with its settings intact.
 
-Left behind, yours to delete: `~/.config/calendar-caldav/` (colours, filters,
-which calendars you ticked) and `~/.cache/calendar-caldav/` (the generated khal
-config, a one-hour cache of calendar names and an index of the reminders). Your `.ics` files, your
-vdirsyncer config and your khal config, if you wrote one, are not this plugin's
-to remove.
+Left behind, yours to delete:
+
+- `~/.config/calendar-caldav/` — colours, filters, which calendars you ticked.
+- `~/.cache/calendar-caldav/` — the generated khal config, a one-hour cache of
+  calendar names and an index of the reminders (event titles and times).
+
+If you used `bin/calendar-setup`, also:
+
+- `~/.config/vdirsyncer/config` and its `config.bak.*` backups. Without a
+  keyring these hold your passwords in plain text.
+- Keyring entries under `service vdirsyncer`, one per account:
+  `secret-tool clear service vdirsyncer account <name>`.
+- The sync timer: `systemctl --user disable --now vdirsyncer.timer`, then
+  delete `~/.config/systemd/user/vdirsyncer.{service,timer}`.
+- `~/.calendars/` (your synced `.ics` files), and vdirsyncer's status and any
+  Google OAuth token in `~/.local/share/vdirsyncer/`.
+
+Removing the plugin does not stop the timer or touch any of these; vdirsyncer
+and khal keep working without it.
 
 ## Licence
 

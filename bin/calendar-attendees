@@ -61,12 +61,13 @@ def calendar_dir() -> Path:
 
     config_home = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
     config_path = Path(config_home) / "calendar-caldav" / "config.json"
+    raw = read_regular_nofollow(str(config_path), 1 << 20)
     try:
-        data = json.loads(config_path.read_text())
-        if isinstance(data, dict) and data.get("calendarDir"):
-            return Path(str(data["calendarDir"])).expanduser()
-    except (OSError, ValueError):
-        pass
+        data = json.loads(raw) if raw is not None else None
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and data.get("calendarDir"):
+        return Path(str(data["calendarDir"])).expanduser()
     return Path.home() / ".calendars"
 
 
@@ -77,7 +78,8 @@ def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
     The descriptor that is checked is the one that is read, so there is
     nothing left to swap in between the two."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: a FIFO planted at the name would otherwise block here.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
     try:
@@ -85,6 +87,7 @@ def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
         if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
             os.close(fd)
             return None
+        os.set_blocking(fd, True)
         with os.fdopen(fd, "rb") as handle:
             data = handle.read(max_bytes + 1)
     except OSError:

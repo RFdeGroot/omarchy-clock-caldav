@@ -819,10 +819,19 @@ Panel {
     return String(event.title || "") + "@" + String(event.start_minutes || "")
   }
 
-  // The title comes out of somebody else's invite and the notification daemon
-  // renders markup, so angle brackets go.
+  // For text the shell renders in a component this plugin cannot pin to
+  // PlainText: a notification's summary and body. The title comes out of
+  // somebody else's invite, so markup characters, C0/C1 controls and bidi
+  // overrides go, and it is capped. A leading dash would be read as an option
+  // by omarchy-notification-send, which takes no "--", so it becomes a
+  // non-breaking hyphen that looks the same.
   function plain(value) {
-    return String(value || "").replace(/[<>]/g, "")
+    var text = String(value || "")
+      .replace(/[<>&]/g, "")
+      .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
+      .trim()
+    if (text.length > 120) text = text.substring(0, 119) + "\u2026"
+    return text.replace(/^-/, "\u2011")
   }
 
   function announceJoin() {
@@ -846,7 +855,7 @@ Panel {
                               "--app-name", "Clock + Calendar",
                               "-g", root.iconJoin,
                               "-u", "critical",
-                              root.plain(joinable.title),
+                              root.plain(joinable.title) || "Meeting",
                               "Starts in a minute, click to join",
                               "--exec", "xdg-open", url]
     joinNotifyProc.running = true
@@ -923,7 +932,7 @@ Panel {
     alarmNotifyProc.command = ["omarchy-notification-send",
                                "--app-name", "Clock + Calendar",
                                "-g", root.iconBell,
-                               root.plain(alarm.title),
+                               root.plain(alarm.title) || "Reminder",
                                root.alarmBody(alarm, url !== ""),
                                "--exec"].concat(action)
     alarmNotifyProc.running = true
@@ -1051,10 +1060,20 @@ Panel {
   // Pulls the vdir up to date against the CalDAV server right now, instead
   // of waiting for the vdirsyncer timer's next run.
   function syncNow() {
-    if (syncing || vdirsyncProc.running) return
+    if (syncing || vdirsyncProc.running || metasyncProc.running) return
     syncing = true
-    vdirsyncProc.command = ["bash", "-lc", "vdirsyncer sync && vdirsyncer metasync"]
+    // Two fixed argv calls rather than `bash -lc "a && b"`: no login profile,
+    // no PATH lookup. metasync only runs when the sync itself succeeded.
+    vdirsyncProc.command = ["/usr/bin/vdirsyncer", "sync"]
     vdirsyncProc.running = true
+  }
+
+  function finishSync() {
+    syncing = false
+    fetchAlarms()
+    skeleton()
+    refresh()
+    refreshWarm()
   }
 
   onOpenedChanged: {
@@ -1180,11 +1199,18 @@ Panel {
   Process {
     id: vdirsyncProc
     onExited: function(exitCode) {
-      root.syncing = false
-      root.skeleton()
-      root.refresh()
-      root.refreshWarm()
+      if (exitCode === 0) {
+        metasyncProc.running = true
+        return
+      }
+      root.finishSync()
     }
+  }
+  Process {
+    id: metasyncProc
+    // metasync carries the calendar names and colours; sync does not.
+    command: ["/usr/bin/vdirsyncer", "metasync"]
+    onExited: root.finishSync()
   }
   Process {
     id: weekProc
@@ -1224,7 +1250,7 @@ Panel {
     function state(): string {
       return JSON.stringify({ viewMode: root.viewMode, dayOffset: root.dayOffset,
                               selDay: root.selDay, reachable: root.reachable,
-                              days: root.days.length, calendars: root.calendars,
+                              days: root.days.length, calendars: root.calendars.length,
                               alarms: root.alarms.length })
     }
     function setView(mode: string): string {
@@ -1332,7 +1358,7 @@ Panel {
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.cycleFormat()
-      else if (b === Qt.MiddleButton) { if (root.bar) root.bar.run("omarchy-menu-timezone") }
+      else if (b === Qt.MiddleButton) { Util.execArgv(["omarchy-menu-timezone"]) }
       else root.toggle()
     }
   }

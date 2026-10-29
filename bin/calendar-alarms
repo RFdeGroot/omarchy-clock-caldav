@@ -57,7 +57,8 @@ def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
     """Same rules as calendar-attendees: no symlinks, regular files only, and a
     size cap checked on the descriptor that is then read."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: a FIFO planted at the name would otherwise block here.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
     try:
@@ -65,6 +66,7 @@ def read_regular_nofollow(path, max_bytes=MAX_ICS_BYTES):
         if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
             os.close(fd)
             return None
+        os.set_blocking(fd, True)
         with os.fdopen(fd, "rb") as handle:
             data = handle.read(max_bytes + 1)
     except OSError:
